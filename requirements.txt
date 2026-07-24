@@ -1,0 +1,17 @@
+# Install into the "STS" conda env:
+#   conda run -n STS pip install -r requirements.txt
+#
+# Core numerics / data
+numpy>=1.26
+scipy>=1.11
+pandas>=2.0
+scikit-learn>=1.3
+
+# Text encoders
+torch>=2.2
+transformers>=4.40
+sentence-transformers>=3.0
+
+# Config / utils
+pyyaml>=6.0
+tqdm>=4.66

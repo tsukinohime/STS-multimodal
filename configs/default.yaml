@@ -1,0 +1,30 @@
+# Reference configuration for text-only zero-shot STS.
+# The CLI (python -m sts.run) is the primary interface; this file documents the
+# defaults and the on-disk data layout under data/raw/.
+
+data:
+  data_root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_data_dir: data/raw/cxc/data                       # sts_val.csv, sts_test.csv
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json  # sentid -> caption
+
+encoder:
+  name: sentence-transformers/all-mpnet-base-v2   # strong general STS baseline
+  backend: sentence-transformers                  # or: hf-mean
+  batch_size: 64
+  device: auto                                    # auto -> cuda > mps > cpu
+  normalize_embeddings: true
+  prompt_prefix: ""                               # e.g. "query: " for E5-family
+  max_seq_length: null
+
+evaluation:
+  datasets: [sick, cxc-val, cxc-test]
+  sick_split: test                                # all | train | trial | test
+  limit: null                                     # subsample N pairs for smoke tests
+  metric: spearman                                # headline metric (pearson also reported)
+
+# Encoder options worth comparing:
+#   sentence-transformers/all-MiniLM-L6-v2     # fast baseline
+#   intfloat/e5-large-v2                        # strong; needs prompt_prefix "query: "
+#   BAAI/bge-large-en-v1.5                      # strong; needs prompt_prefix
+#   princeton-nlp/sup-simcse-roberta-large     # classic STS baseline (backend: hf-mean, pooling: cls)
