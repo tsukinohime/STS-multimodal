@@ -1,0 +1,136 @@
+# =============================================================================
+# Milestone 1 — text-only zero-shot STS baseline.
+#
+# Frozen pretrained encoders, L2-normalised embeddings, cosine similarity as the
+# prediction, Spearman (headline) + Pearson against human gold scores.
+# No training, fine-tuning, regression, calibration or test-set tuning anywhere.
+#
+# "Zero-shot" here means: not trained on the target datasets *in this project*.
+# It does NOT claim the encoders' pretraining corpora are disjoint from these
+# benchmarks — COCO captions in particular are widely used in pretraining.
+#
+#   python -m sts.cli run --config configs/text_only.yaml
+# =============================================================================
+
+experiment:
+  name: text_only_baseline
+  output_dir: outputs/text_only
+  seed: 42
+  # Skip any (model, dataset) whose prediction CSV already exists. Combined
+  # with the embedding cache this makes a killed job cheap to restart.
+  resume: true
+
+# -----------------------------------------------------------------------------
+# Data. Paths are relative to the repo root; override for a cluster filesystem
+# (or set data.root and leave the rest to default).
+# -----------------------------------------------------------------------------
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data                                    # sts_val.csv / sts_test.csv
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json  # sentid -> caption + cocoid
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+# Reported separately, never concatenated into one global correlation.
+#   cxc-val / cxc-test : caption-caption STS, gold = agg_score in [0, 5]
+#   sick-test          : SICK-Relatedness official TEST split, gold in [1, 5]
+#   sick-all           : every SICK pair — reported for completeness, and it
+#                        CONTAINS sick-test, so only one of the two may feed
+#                        the macro average
+#   sts3k              : the complete STS3k file, gold in [0, 1]
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+# -----------------------------------------------------------------------------
+# Inference. Defaults suit one H100 on TSUBAME4; `device: auto` also resolves
+# to MPS on an Apple-silicon laptop, where dtype auto-resolves to float32.
+# -----------------------------------------------------------------------------
+runtime:
+  device: auto          # auto -> cuda > mps > cpu
+  dtype: auto           # auto -> bfloat16 on cuda (checkpoint dtype), float32 otherwise
+  batch_size: 64
+  max_length: 512       # far above these corpora; truncation is counted and reported
+  cache_dir: .cache/embeddings
+  use_cache: true
+  flush_every: 2048     # unique texts encoded between cache flushes = resume granularity
+  progress: true
+  seed: 42
+
+# -----------------------------------------------------------------------------
+# Models — all frozen, all inference-only.
+#
+# Main model: jina-embeddings-v5-omni-small. `task: text-matching` selects the
+# symmetric-similarity LoRA adapter (the one the model card names for STS), and
+# the checkpoint's own encode() applies the official "Document: " prefix,
+# last-token pooling and L2 normalisation. `modality: text` skips loading the
+# vision and audio towers — text embeddings are unaffected, and the visual
+# milestone reloads the same repo with modality: vision to get image vectors in
+# this same space.
+#
+# Control: jina-embeddings-v5-text-small, the text-only sibling (677M vs 1.74B)
+# that Jina states shares a vector space with the omni model. Running both here
+# gives the text-only reference for that pairing; `python -m sts.cli align`
+# measures how well the shared-space claim actually holds.
+#
+# truncate_dim: null keeps the full 1024-dim embedding (both models are
+# Matryoshka-capable; we do not truncate).
+# -----------------------------------------------------------------------------
+models:
+  - key: jina-v5-omni-small
+    model_id: jinaai/jina-embeddings-v5-omni-small
+    backend: jina-v5
+    task: text-matching
+    prompt_name: document
+    modality: text
+    truncate_dim: null
+    batch_size: 32
+    enabled: true
+    notes: "Main model. 1.74B, 1024-dim, last-token pooling. Reload with modality: vision for the image side."
+
+  - key: jina-v5-text-small
+    model_id: jinaai/jina-embeddings-v5-text-small
+    backend: jina-v5
+    task: text-matching
+    prompt_name: document
+    truncate_dim: null
+    batch_size: 64
+    enabled: true
+    notes: "Text-only sibling, 677M, 1024-dim. Same space as omni-small per the model card — verify with `sts.cli align`."
+
+  # ---- Additional baselines, off by default -------------------------------
+  # Enable to place the jina-v5 numbers against a well-known reference point.
+  - key: e5-large-v2
+    model_id: intfloat/e5-large-v2
+    backend: hf
+    pooling: mean               # official E5 pooling
+    prompt_prefix: "query: "    # official E5 prefix; symmetric tasks use it on both sides
+    batch_size: 64
+    enabled: false
+    notes: "Strong pure-text baseline, 335M, 1024-dim."
+
+  - key: minilm-l6-v2
+    model_id: sentence-transformers/all-MiniLM-L6-v2
+    backend: sentence-transformers
+    batch_size: 128
+    enabled: false
+    notes: "22M sanity encoder — used to exercise the pipeline without a large download."
+
+# -----------------------------------------------------------------------------
+# Metrics
+# -----------------------------------------------------------------------------
+metrics:
+  bootstrap: 0            # set to 1000 for pair-level bootstrap 95% CIs (costly on CxC)
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true    # per-category rows wherever the source file provides a category
+  # Unweighted mean over these datasets. sick-all is excluded on purpose: it
+  # contains sick-test, so including both would double-count SICK.
+  macro_average_over:
+    - cxc-val
+    - cxc-test
+    - sick-test
+    - sts3k

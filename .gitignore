@@ -56,3 +56,6 @@ htmlcov/
 .vscode/*
 !.vscode/settings.json
 *.swp
+
+# ---- TSUBAME site config (group, paths, account: never commit) ----
+tsubame/

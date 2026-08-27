@@ -1,0 +1,87 @@
+# =============================================================================
+# 32-pair smoke test — same code path as the real run, small enough for a
+# laptop (Apple M4 / MPS / 16 GB).
+#
+#   python scripts/smoke_test.py --config configs/smoke.yaml
+#
+# The 32 pairs per dataset are sampled stratified over the pair category, so
+# every CxC sampling_method and every SICK source corpus is exercised.
+#
+# By default this runs the tiny MiniLM encoder so the smoke test needs no
+# multi-GB download. To smoke-test the real models instead:
+#   python scripts/smoke_test.py --config configs/smoke.yaml \
+#          --models jina-v5-text-small
+# (flip `enabled` below, or pass --models; weights download on first use).
+# =============================================================================
+
+experiment:
+  name: smoke
+  output_dir: outputs/smoke
+  seed: 42
+  limit: 32                # pairs per dataset
+  resume: false            # a smoke test should always recompute
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: auto             # -> mps on Apple silicon
+  dtype: auto              # -> float32 off cuda
+  batch_size: 8            # small enough for 16 GB unified memory with a 1.7B model
+  max_length: 512
+  cache_dir: .cache/embeddings   # shared with the full run: warm cache carries over
+  use_cache: true
+  flush_every: 64
+  progress: true
+  seed: 42
+
+models:
+  - key: minilm-l6-v2
+    model_id: sentence-transformers/all-MiniLM-L6-v2
+    backend: sentence-transformers
+    batch_size: 32
+    enabled: true
+    notes: "22M pipeline-exercise encoder; no large download."
+
+  - key: jina-v5-text-small
+    model_id: jinaai/jina-embeddings-v5-text-small
+    backend: jina-v5
+    task: text-matching
+    prompt_name: document
+    truncate_dim: null
+    batch_size: 8
+    enabled: false
+    notes: "677M — ~1.4 GB download on first use."
+
+  - key: jina-v5-omni-small
+    model_id: jinaai/jina-embeddings-v5-omni-small
+    backend: jina-v5
+    task: text-matching
+    prompt_name: document
+    modality: text
+    truncate_dim: null
+    batch_size: 4
+    enabled: false
+    notes: "1.74B — ~3.5 GB download on first use; modality: text keeps only the text tower resident."
+
+metrics:
+  bootstrap: 200           # cheap at 32 pairs; exercises the CI code path
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  macro_average_over:
+    - cxc-val
+    - cxc-test
+    - sick-test
+    - sts3k
