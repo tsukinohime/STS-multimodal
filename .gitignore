@@ -1,22 +1,26 @@
-# ---- Data (never commit datasets; they live in ~/data/raw) ----
-data/
-raw/
+# NOTE: patterns below are anchored with a leading "/" so they match only at
+# the repo root. Unanchored ("data/") matches a directory of that name at ANY
+# depth, which silently excluded the source packages sts/data/ and sts/models/.
+
+# ---- Data (never commit datasets; they live under data/raw) ----
+/data/
+/raw/
 *.zip
 *.tar
 *.tar.gz
 *.jsonl
 
 # ---- Experiment outputs ----
-outputs/
-results/
-runs/
+/outputs/
+/results/
+/runs/
 *.log
 
 # ---- Model / HF caches ----
-.cache/
+/.cache/
 **/.cache/
-models/
-checkpoints/
+/models/
+/checkpoints/
 *.pt
 *.bin
 *.safetensors
@@ -58,4 +62,4 @@ htmlcov/
 *.swp
 
 # ---- TSUBAME site config (group, paths, account: never commit) ----
-tsubame/
+tsubame/env.sh

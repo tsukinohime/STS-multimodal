@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from . import archive
 from .config import ExperimentConfig, get_logger
 from .data import STSDataset, load_dataset
 from .data.cxc import _parse_sentid, load_coco_karpathy_index
@@ -101,7 +102,7 @@ def check_cxc_caption_mapping(config: ExperimentConfig) -> CheckResult:
         ("cxc-val", config.data.cxc_dir / "sts_val.csv"),
         ("cxc-test", config.data.cxc_dir / "sts_test.csv"),
     ]
-    files = [(name, path) for name, path in files if path.exists()]
+    files = [(name, path) for name, path in files if archive.exists(path)]
     if not files:
         return CheckResult("cxc_caption_ids_resolve", True, "no CxC files present; skipped")
 
@@ -109,7 +110,8 @@ def check_cxc_caption_mapping(config: ExperimentConfig) -> CheckResult:
     report = []
     ok = True
     for name, path in files:
-        frame = pd.read_csv(path)
+        with archive.open_binary(path) as handle:
+            frame = pd.read_csv(handle)
         ids = set(frame["caption1"]) | set(frame["caption2"])
         sentids = {_parse_sentid(i) for i in ids}
         unmapped_text = [s for s in sentids if s not in text_by_sentid]

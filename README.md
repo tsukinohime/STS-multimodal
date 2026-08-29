@@ -148,6 +148,30 @@ data/raw/
 
 Override with `data.root` in the YAML or `--data-root` on the command line.
 
+### Reading straight from `.tar` archives
+
+Cluster filesystems meter inode count as well as bytes, and COCO's ~123k images
+make extraction impractical there. Any of the paths above is therefore *also*
+satisfied by a matching member of a `.tar` in an ancestor directory:
+
+```
+data/raw/
+  coco.tar    → coco_karpathy/dataset_coco.json
+  cxc.tar     → cxc/data/sts_val.csv, cxc/data/sts_test.csv
+  sick/SICK.txt          (plain file; small enough not to bother)
+  sts3k/STS3k_all.txt    (plain file)
+```
+
+Nothing needs extracting and **the config does not change** — [sts/archive.py](sts/archive.py)
+indexes each archive's members once and resolves paths against that index, so
+the archive's own filename need not match the directory it contains. Files are
+hashed by **content**, so a manifest produced from archives is directly
+comparable with one produced from extracted files (verified: identical
+SHA-256s and identical correlations either way).
+
+Use **uncompressed** `.tar`. `.tar.gz` works but every member read decompresses
+from the start of the archive; the loader warns when it sees one.
+
 ## Run
 
 Everything is driven by one YAML file.
@@ -273,6 +297,7 @@ sts/
     base.py        TextEncoder interface + factory
     jina_v5.py     jina-embeddings-v5 (official encode() path)
     sentence_transformer.py   hf_mean.py
+  archive.py       transparent reads from .tar archives (cluster inode limits)
   cache.py         content-addressed embedding cache (sharded, atomic, resumable)
   similarity.py    paired cosine similarity
   metrics.py       Spearman / Pearson / bootstrap CI / macro average

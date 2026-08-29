@@ -79,11 +79,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--config", "-c", type=Path, default=REPO_ROOT / "configs" / "smoke.yaml")
     parser.add_argument("--models", nargs="+", default=None, help="override the enabled model keys")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--data-root", type=Path, default=None,
+                        help="override data.root (e.g. the WORK disk on a cluster)")
     parser.add_argument("--keep-cache", action="store_true",
                         help="do not clear this config's embedding cache first (skips the cold-run check)")
     args = parser.parse_args(argv)
 
-    config = load_config(args.config, overrides={"models": args.models, "device": args.device})
+    config = load_config(args.config, overrides={
+        "models": args.models, "device": args.device, "data_root": args.data_root,
+    })
     output_dir = config.output_dir
     manifest_path = output_dir / "manifest.json"
 
@@ -92,6 +96,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         passthrough += ["--models", *args.models]
     if args.device:
         passthrough += ["--device", args.device]
+    if args.data_root:
+        passthrough += ["--data-root", str(args.data_root)]
 
     print("=" * 78)
     print(f"SMOKE TEST  |  config={args.config.name}  limit={config.limit} pairs/dataset")

@@ -22,7 +22,20 @@ experiment:
 
 # -----------------------------------------------------------------------------
 # Data. Paths are relative to the repo root; override for a cluster filesystem
-# (or set data.root and leave the rest to default).
+# (or set data.root and leave the rest to default, or pass --data-root).
+#
+# These paths are written as if every corpus were extracted, but a path is also
+# satisfied by a matching member of a `.tar` sitting in an ancestor directory.
+# So on TSUBAME, where storage discourages large numbers of small files, this
+# layout works unchanged:
+#
+#     data/raw/coco.tar   containing  coco_karpathy/dataset_coco.json
+#     data/raw/cxc.tar    containing  cxc/data/sts_val.csv, sts_test.csv
+#     data/raw/sick/SICK.txt          (plain file — small, no need to archive)
+#     data/raw/sts3k/STS3k_all.txt    (plain file)
+#
+# Nothing needs extracting, and content hashes in the manifest are identical
+# either way. Use uncompressed .tar: members are then found by seeking.
 # -----------------------------------------------------------------------------
 data:
   root: data/raw
