@@ -1,3 +1,13 @@
+# Requires Python >= 3.10; 3.11 is what this project is validated on.
+#
+# This is a hard floor, not a preference. jina-embeddings-v5-omni-small's remote
+# modeling code imports Qwen3VL and Qwen2.5-Omni components that exist only in
+# transformers 5.x, and every transformers 5.x release declares
+# requires_python >= 3.10.0. torch >= 2.13, peft >= 0.20 and
+# sentence-transformers >= 6.0 all do the same. A cluster's default Python 3.9
+# therefore cannot run the main model at all — build a 3.11 env instead of
+# relaxing the pins below (see tsubame/README.md).
+#
 # Install into the "STS" conda env:
 #   conda run -n STS pip install -r requirements.txt
 #

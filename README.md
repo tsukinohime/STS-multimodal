@@ -249,6 +249,33 @@ Two levels of resume:
   (atomic temp-file + rename), so a job killed mid-encode restarts near where
   it stopped.
 
+### Cache file count
+
+The cache stores one shard per `flush_every` texts, never one file per text —
+which matters on a cluster that meters inodes. For the full text-only run
+(~60k unique texts, 1024-dim float32, `flush_every: 2048`):
+
+| | per model | both models |
+|---|---|---|
+| shards | 33 | 66 |
+| files (+ `meta.json`) | 34 | 68 |
+| size | 234 MB | 468 MB |
+| mean file size | 7.1 MB | 7.1 MB |
+
+Repeatedly resuming an interrupted job leaves one shard per interrupted block,
+so the count can drift upward over time. `cache --compact` merges them back
+into a single file:
+
+```bash
+python -m sts.cli cache --config configs/text_only.yaml            # show size
+python -m sts.cli cache --config configs/text_only.yaml --compact  # merge shards
+```
+
+Compaction is crash-safe (merged shard is written and renamed into place before
+the originals are removed) and content-preserving — verified bit-identical.
+Raising `flush_every` also reduces the file count, at the cost of coarser
+resume granularity.
+
 ## TSUBAME4
 
 See **[tsubame/README.md](tsubame/README.md)** for login-node vs. compute-node

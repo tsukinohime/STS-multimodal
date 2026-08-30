@@ -53,13 +53,50 @@ are downloaded on the login node first (step 2 below) and the jobs then run with
 cp tsubame/env.sh.example tsubame/env.sh
 $EDITOR tsubame/env.sh          # at minimum: STS_GROUP, STS_CONDA_SH, STS_DATA_ROOT
 
-# 2. Python env (login node).
-conda create -n STS python=3.11 -y
-conda activate STS
+# 2. Python env (login node). MUST be >= 3.10 — see "Python version" below.
+conda create -p $STS_REPO/../venvs/sts python=3.11 -y
+conda activate $STS_REPO/../venvs/sts
 pip install -r requirements.txt
 
 # 3. Model weights into the shared HF cache (login node — needs network).
 bash tsubame/prefetch_models.sh
+```
+
+### Python version
+
+**The system Python (3.9) cannot run this project.** Not a preference — the
+main model's remote modeling code imports `Qwen3VL` and `Qwen2.5-Omni`
+components that exist only in `transformers` 5.x, and every `transformers` 5.x
+release declares `requires_python >= 3.10.0`. `torch >= 2.13`, `peft >= 0.20`
+and `sentence-transformers >= 6.0` have the same floor. Relaxing the pins in
+`requirements.txt` is not an option: `transformers` 4.x has no `Qwen3VL`, so
+`jina-v5-omni-small` simply fails to load.
+
+Use **Python 3.11** (what this project is validated against), in this order of
+preference:
+
+1. A site module, if one exists — `module avail 2>&1 | grep -iE "python|conda"`.
+   If you go this way, the job script must `module load` the *same* module
+   before activating the env, or the compute node won't find the interpreter.
+2. A site `conda`/`miniforge` module, with `conda create -p <path-on-group-disk>`
+   so the env does not eat the small home quota.
+3. Miniforge installed into group storage yourself — needs no admin rights and
+   no `module load` at job time, which makes it the most robust option:
+
+   ```bash
+   curl -L -o miniforge.sh \
+     https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+   bash miniforge.sh -b -p <groupdir>/miniforge && rm miniforge.sh
+   source <groupdir>/miniforge/etc/profile.d/conda.sh
+   conda create -p <groupdir>/venvs/sts python=3.11 -y
+   ```
+
+Verify before submitting anything — `transformers` must report **5.x**:
+
+```bash
+python -V
+python -c "import torch, transformers, peft, sentence_transformers as st; \
+print(torch.__version__, transformers.__version__, peft.__version__, st.__version__)"
 ```
 
 Keep `STS_DATA_ROOT`, `STS_OUTPUT_DIR`, `STS_CACHE_DIR` and `HF_HOME` on group
@@ -109,6 +146,21 @@ Jobs are resumable by design, so a walltime kill costs almost nothing:
 
 To resume, resubmit the identical command. To force a clean recompute, add
 `--no-resume` (or delete the prediction CSVs).
+
+### Keeping the inode count down
+
+The embedding cache is sharded, not one-file-per-text: the full text-only run
+leaves ~34 files of ~7 MB per model, which is the file profile this filesystem
+wants. Each interrupted-and-resumed block does add a shard, so after a run that
+was restarted several times, merge them:
+
+```bash
+python -m sts.cli cache --config configs/text_only.yaml            # show size
+python -m sts.cli cache --config configs/text_only.yaml --compact  # merge shards
+```
+
+Datasets stay archived — `.tar` files are read in place, never extracted (see
+the main README).
 
 ## Troubleshooting
 

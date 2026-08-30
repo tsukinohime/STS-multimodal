@@ -194,3 +194,67 @@ class EmbeddingCache:
 
     def __len__(self) -> int:
         return len(self._index) + len(self._pending_keys)
+
+    # -- maintenance -------------------------------------------------------
+    def stat(self) -> Dict[str, object]:
+        """File count and size of this cache on disk."""
+        shards = sorted(self.directory.glob("shard-*.npz"))
+        total = sum(s.stat().st_size for s in shards)
+        return {
+            "directory": str(self.directory),
+            "n_vectors": len(self._index),
+            "n_shards": len(shards),
+            "bytes": total,
+            "mean_shard_bytes": int(total / len(shards)) if shards else 0,
+        }
+
+    def compact(self) -> Dict[str, object]:
+        """Merge every shard into one file.
+
+        Resuming a job repeatedly leaves one shard per interrupted block, and
+        cluster filesystems meter inode count. Compacting after a run finishes
+        collapses those into a single file with identical contents.
+
+        Crash-safe: the merged shard is written and renamed into place *before*
+        the originals are removed, so an interruption at any point leaves a
+        cache that still loads (duplicate keys resolve to the same vector).
+        """
+        before = self.stat()
+        shards = sorted(self.directory.glob("shard-*.npz"))
+        if len(shards) <= 1:
+            return {"before": before, "after": before, "merged": False}
+
+        self.flush()
+        if self._vectors is None or not self._index:
+            return {"before": before, "after": before, "merged": False}
+
+        # Keep one row per key, in the index's current row order.
+        keys = np.array(list(self._index.keys()), dtype="<U40")
+        rows = np.array(list(self._index.values()), dtype=np.int64)
+        vectors = self._vectors[rows]
+
+        staging = self.directory / "shard-99999.npz"
+        temp = self.directory / f".tmp-{uuid.uuid4().hex}.npz"
+        try:
+            with open(temp, "wb") as handle:
+                np.savez(handle, keys=keys, vectors=vectors)
+            os.replace(temp, staging)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+
+        for shard in shards:                 # originals are now redundant
+            shard.unlink(missing_ok=True)
+        os.replace(staging, self.directory / "shard-00000.npz")
+
+        self._shard_counter = 1
+        self._vectors = vectors
+        self._index = {str(k): i for i, k in enumerate(keys)}
+
+        after = self.stat()
+        _log.info(
+            "Compacted %s: %d shards -> %d (%d vectors, %.1f MB)",
+            self.directory.name, before["n_shards"], after["n_shards"],
+            after["n_vectors"], after["bytes"] / 1024 ** 2,
+        )
+        return {"before": before, "after": after, "merged": True}

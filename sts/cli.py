@@ -166,6 +166,43 @@ def command_align(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_cache(args: argparse.Namespace) -> int:
+    """Show, and optionally compact, this config's embedding caches."""
+    from .cache import EmbeddingCache
+    from .config import resolve_device, resolve_dtype
+
+    config = _config_from(args)
+    device = resolve_device(config.runtime.device)
+
+    total_files = total_bytes = 0
+    for model_spec in config.enabled_models:
+        dtype = resolve_dtype(model_spec.dtype or config.runtime.dtype, device)
+        cache = EmbeddingCache(
+            cache_dir=config.runtime.cache_dir,
+            model_key=model_spec.key,
+            fingerprint={**model_spec.fingerprint(), "resolved_dtype": dtype},
+            enabled=True,
+        )
+        if args.compact:
+            result = cache.compact()
+            stat = result["after"]
+            note = (f"  ({result['before']['n_shards']} -> {stat['n_shards']} shards)"
+                    if result["merged"] else "  (already compact)")
+        else:
+            stat = cache.stat()
+            note = ""
+        total_files += stat["n_shards"] + 1  # + meta.json
+        total_bytes += stat["bytes"]
+        print(f"\n{model_spec.key}  [dtype={dtype}]")
+        print(f"  {stat['directory']}")
+        print(f"  {stat['n_vectors']:,} vectors | {stat['n_shards']} shard(s) "
+              f"| {stat['bytes'] / 1024 ** 2:.1f} MB "
+              f"| mean {stat['mean_shard_bytes'] / 1024 ** 2:.1f} MB/shard{note}")
+
+    print(f"\nTotal: {total_files} file(s), {total_bytes / 1024 ** 2:.1f} MB\n")
+    return 0
+
+
 def command_datasets(_: argparse.Namespace) -> int:
     print("\nAvailable datasets:\n")
     for name, description in sorted(AVAILABLE_DATASETS.items()):
@@ -206,6 +243,14 @@ def build_parser() -> argparse.ArgumentParser:
     align_parser.add_argument("--dataset", default="sick-test", help="dataset to measure on")
     align_parser.add_argument("--sample", type=int, default=512, help="pairs to sample")
     align_parser.set_defaults(func=command_align)
+
+    cache_parser = subparsers.add_parser(
+        "cache", help="show embedding-cache size, or merge its shards into one file"
+    )
+    _add_common(cache_parser)
+    cache_parser.add_argument("--compact", action="store_true",
+                              help="merge all shards into one file (fewer inodes on a cluster)")
+    cache_parser.set_defaults(func=command_cache)
 
     datasets_parser = subparsers.add_parser("datasets", help="list the registered datasets")
     datasets_parser.set_defaults(func=command_datasets)
