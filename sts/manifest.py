@@ -78,10 +78,12 @@ def hardware_info(device: str) -> Dict[str, Any]:
             info["gpu_name"] = "Apple Silicon (MPS)"
     except Exception:  # torch missing or a driver hiccup must not kill the run
         pass
-    # PBS fills these on TSUBAME; absent locally.
-    for key in ("PBS_JOBID", "PBS_JOBNAME", "PBS_QUEUE", "PBS_O_HOST"):
+    # Grid Engine fills these on TSUBAME; absent locally. Recorded so a result
+    # can be traced back to the exact scheduler job that produced it.
+    for key in ("JOB_ID", "JOB_NAME", "QUEUE", "SGE_O_HOST", "NSLOTS",
+                "PE_HOSTFILE", "SGE_TASK_ID"):
         if os.environ.get(key):
-            info[key.lower()] = os.environ[key]
+            info[f"sge_{key.lower()}"] = os.environ[key]
     return info
 
 

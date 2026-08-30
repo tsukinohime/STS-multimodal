@@ -278,8 +278,8 @@ resume granularity.
 
 ## TSUBAME4
 
-See **[tsubame/README.md](tsubame/README.md)** for login-node vs. compute-node
-usage, resource types and troubleshooting. Short version:
+TSUBAME runs the **Grid Engine** scheduler. See **[tsubame/README.md](tsubame/README.md)**
+for login-node vs. compute-node usage, resource types and troubleshooting. Short version:
 
 ```bash
 cp tsubame/env.sh.example tsubame/env.sh   # group, paths, env, resource type
@@ -291,7 +291,7 @@ python -m sts.cli report --config configs/text_only.yaml   # merge the results
 
 Nothing site-specific (username, group, paths, env) is hardcoded — it all lives
 in the gitignored `tsubame/env.sh`. Compute nodes run with `HF_HUB_OFFLINE=1`
-against the prefetched cache. Jobs are per-model and resumable, so a walltime
+against the prefetched cache. Jobs are per-model and resumable, so an h_rt
 kill costs almost nothing.
 
 ## Validation

@@ -1,25 +1,26 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# PBS job: run the text-only STS experiment for ONE model.
+# Grid Engine job: run the text-only STS experiment for ONE model.
 #
-# Never submit this by hand — tsubame/submit.sh passes the queue, walltime,
-# group and model on the qsub command line, so nothing site-specific is baked
-# into this file. Directives below are only fallbacks for a bare `qsub`.
+# Submit via tsubame/submit.sh, which supplies the resource type, runtime,
+# group and model on the qsub command line — nothing site-specific is baked in
+# here. The `#$` directives below are only fallbacks for a bare `qsub`.
 #
-# Resumable: with `resume: true` in the YAML, a job that hits the walltime limit
-# can simply be resubmitted. Finished (model, dataset) predictions are reused,
-# and the embedding cache (flushed every `flush_every` texts) means even a
+# Resumable: with `resume: true` in the YAML, a job that hits the h_rt limit can
+# simply be resubmitted. Finished (model, dataset) predictions are reused, and
+# the embedding cache (flushed every `flush_every` texts) means even a
 # partly-encoded dataset restarts near where it stopped.
 # -----------------------------------------------------------------------------
-#PBS -N sts-text
-#PBS -l select=1
-#PBS -l walltime=4:00:00
-#PBS -j oe
+#$ -cwd
+#$ -N sts-text
+#$ -l h_rt=1:00:00
+#$ -j y
 
 set -euo pipefail
 
-# qsub starts the job in $HOME; PBS_O_WORKDIR is where it was submitted from.
-cd "${PBS_O_WORKDIR:-$(pwd)}"
+# `#$ -cwd` already starts the job in the submission directory; SGE_O_WORKDIR is
+# the belt-and-braces fallback when this script is run without that directive.
+cd "${SGE_O_WORKDIR:-$(pwd)}"
 
 source "${STS_REPO:-$(pwd)}/tsubame/activate_env.sh"
 cd "$STS_REPO"
@@ -28,7 +29,7 @@ MODEL="${STS_MODEL:?STS_MODEL is not set — submit via tsubame/submit.sh}"
 
 echo
 echo "=============================================================================="
-echo " job      : ${PBS_JOBID:-<interactive>}  on $(hostname)"
+echo " job      : ${JOB_ID:-<interactive>} (${JOB_NAME:-?})  on $(hostname)"
 echo " model    : $MODEL"
 echo " config   : $STS_CONFIG"
 echo " started  : $(date -Is)"
@@ -37,8 +38,8 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>
   || echo "(no nvidia-smi on this node)"
 echo
 
-# Keep BLAS from oversubscribing the cores PBS actually gave us.
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${NCPUS:-8}}"
+# Keep BLAS from oversubscribing the cores the scheduler actually granted.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${NSLOTS:-8}}"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 

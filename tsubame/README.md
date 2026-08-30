@@ -1,17 +1,18 @@
 # Running on TSUBAME4
 
-TSUBAME4 (Institute of Science Tokyo) uses the **PBS Professional** scheduler:
-`qsub` to submit, `qstat` to watch, `qdel` to cancel.
+TSUBAME uses the **Grid Engine** scheduler: `qsub` to submit a batch job, `qrsh`
+for an interactive one, `qstat` to watch, `qdel` to cancel.
 
-> The resource-type names, storage paths and login hostname below are
-> site-specific and do change. Confirm them against the current TSUBAME4 user
-> guide and your own `t4-user-info group list` before the first submission.
-> Nothing in this repository hardcodes them — they all live in `tsubame/env.sh`.
+> Resource-type names, storage paths and the login hostname are site-specific
+> and do change. Confirm them against the current TSUBAME user guide and your
+> own account before the first submission — `qconf -sc` lists the schedulable
+> resource attributes. Nothing in this repository hardcodes them; they all live
+> in `tsubame/env.sh`.
 
 ## Login node vs. compute node
 
 ```
-your laptop  --ssh-->  login node  --qsub-->  compute node (GPU)
+your laptop  --ssh-->  login node  --qsub/qrsh-->  compute node (GPU)
 ```
 
 **Login node** — shared by everyone. Only for editing files, `git`, installing
@@ -22,28 +23,45 @@ job on a login node gets killed and is bad manners.
 
 ```bash
 # 1. Batch (what you want for the real run): submit and walk away.
-qsub -q gpu_1 -l select=1 -l walltime=4:00:00 -P <group> job.sh
+qsub -g <group> -l <resource>=1 -l h_rt=1:00:00 job.sh
 
 # 2. Interactive: get a shell on a GPU node, for debugging.
-qsub -I -q gpu_1 -l select=1 -l walltime=1:00:00 -P <group>
+qrsh -g <group> -l <resource>=1 -l h_rt=1:00:00
 ```
 
-`-q` picks the **resource type** (how much of a node you get). This experiment
-is single-GPU, so the smallest GPU allocation is right:
+`-l <resource>=<count>` picks the **resource type** — how much of a node you
+get. This experiment is single-GPU, so the smallest GPU allocation is right.
+The usual TSUBAME names are node fractions:
 
-| resource type | GPUs | use here                                    |
-|---------------|------|---------------------------------------------|
-| `gpu_1`       | 1    | **default** — everything in this project    |
-| `node_q`      | 1    | 1 GPU plus a quarter node of CPU/RAM        |
-| `node_h`      | 2    | not needed                                  |
-| `node_f`      | 4    | not needed                                  |
+| resource type | GPUs | use here                                 |
+|---------------|------|------------------------------------------|
+| `s_gpu`       | 1    | **default here** — smallest GPU slice    |
+| `q_node`      | 1    | 1 GPU plus a quarter node of CPU/RAM     |
+| `h_node`      | 2    | not needed                               |
+| `f_node`      | 4    | not needed                               |
 
-`-P <group>` charges the job to your TSUBAME group. Omit it to get a **trial
-run** (お試し実行), which needs no group but is capped in nodes and walltime —
-fine for a smoke test, not for the full CxC run.
+`-l h_rt=HH:MM:SS` is the runtime limit (Grid Engine's equivalent of a
+walltime). `-g <group>` charges the job to your TSUBAME group; omit it for a
+**trial run** (お試し実行), which needs no group but is capped in size and
+runtime — fine for a smoke test, not for the full CxC run.
+
+### Grid Engine vs. PBS
+
+If you follow a PBS-flavoured tutorial, these are the things that differ:
+
+| | PBS Pro | **Grid Engine (here)** |
+|---|---|---|
+| script directive | `#PBS` | `#$` |
+| group / account | `-P <group>` | `-g <group>` |
+| resources | `-q <queue> -l select=1` | `-l <type>=<n>` |
+| runtime limit | `-l walltime=…` | `-l h_rt=…` |
+| start in submit dir | `cd $PBS_O_WORKDIR` | `#$ -cwd` |
+| job id variable | `$PBS_JOBID` | `$JOB_ID` |
+| merge stderr | `-j oe` | `-j y` |
+| interactive | `qsub -I` | `qrsh` |
 
 Compute nodes generally have **no internet access**, which is why model weights
-are downloaded on the login node first (step 2 below) and the jobs then run with
+are downloaded on the login node first (step 3 below) and the jobs then run with
 `HF_HUB_OFFLINE=1`.
 
 ## Setup, once
@@ -107,7 +125,7 @@ quota is small and the HF cache alone is several GB.
 
 ```bash
 # Sanity check on a small allocation first (32 pairs/dataset, minutes).
-qsub -I -q gpu_1 -l select=1 -l walltime=0:30:00 -P <group>
+qrsh -g <group> -l s_gpu=1 -l h_rt=0:30:00
 #   ... on the compute node:
 cd $STS_REPO && source tsubame/activate_env.sh
 python scripts/smoke_test.py --config configs/smoke.yaml --device cuda
@@ -118,8 +136,8 @@ bash tsubame/submit.sh
 # Inspect the qsub lines without submitting.
 DRY_RUN=1 bash tsubame/submit.sh
 
-# Just one model, with a longer walltime.
-STS_WALLTIME=8:00:00 bash tsubame/submit.sh jina-v5-omni-small
+# Just one model, with a longer runtime limit.
+STS_H_RT=8:00:00 bash tsubame/submit.sh jina-v5-omni-small
 ```
 
 Watch and collect:
@@ -127,7 +145,7 @@ Watch and collect:
 ```bash
 qstat -u $USER                 # queued / running
 qdel <jobid>                   # cancel
-tail -f logs/sts-*.o*          # job output (PBS names it <jobname>.o<jobid>)
+tail -f logs/sts-*.o*          # job output (Grid Engine names it <jobname>.o<jobid>)
 
 # Merge the per-model manifests into one metrics.csv + summary.md.
 python -m sts.cli report --config configs/text_only.yaml
@@ -135,7 +153,7 @@ python -m sts.cli report --config configs/text_only.yaml
 
 ## Resuming
 
-Jobs are resumable by design, so a walltime kill costs almost nothing:
+Jobs are resumable by design, so an h_rt kill costs almost nothing:
 
 * Each `(model, dataset)` writes its own `predictions/<model>/<dataset>.csv`.
   With `resume: true` (the default) a resubmitted job skips the finished ones.
@@ -166,8 +184,9 @@ the main README).
 
 | symptom | cause / fix |
 |---|---|
-| `qsub: Unauthorized Request` | `STS_GROUP` wrong or expired — check `t4-user-info group list` |
+| `Unable to run job: ... no suitable queues` | `STS_RESOURCE` name wrong for this site — check `qconf -sc` |
+| job rejected on the group | `STS_GROUP` wrong or expired — check your account's group list |
 | job dies instantly, log mentions `CalledProcessError` in `activate_env.sh` | `STS_CONDA_SH` not set; it is `$(conda info --base)/etc/profile.d/conda.sh` |
 | `OSError: … not a local folder … HF_HUB_OFFLINE=1` | weights not prefetched, or `HF_HOME` differs between login and compute — rerun `prefetch_models.sh` with the same `env.sh` |
 | CUDA OOM | lower `STS_BATCH_SIZE`; these models are small, so 64 is already conservative |
-| job runs but is very slow | check `nvidia-smi` in the log; if it reports no GPU the job landed on a CPU resource type |
+| job runs but is very slow | check `nvidia-smi` in the log; if it reports no GPU the job landed on a CPU-only resource type |

@@ -1,14 +1,17 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# Submit one independent PBS job per model.
+# Submit one independent Grid Engine job per model.
 #
 #   bash tsubame/submit.sh                          # every model in STS_MODELS
 #   bash tsubame/submit.sh jina-v5-omni-small       # just this one
-#   STS_WALLTIME=8:00:00 bash tsubame/submit.sh     # override any env.sh value
+#   STS_H_RT=8:00:00 bash tsubame/submit.sh         # override any env.sh value
 #   DRY_RUN=1 bash tsubame/submit.sh                # print the qsub lines only
 #
-# Separate jobs mean one model failing or running out of walltime never blocks
-# the others, and each can be resubmitted on its own to resume.
+# Separate jobs mean one model failing or running out of h_rt never blocks the
+# others, and each can be resubmitted on its own to resume.
+#
+# Grid Engine, not PBS: resources are `-l <type>=<n>`, the runtime limit is
+# `-l h_rt=`, the accounting group is `-g`, and stderr merges with `-j y`.
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -35,12 +38,14 @@ fi
 
 mkdir -p "$STS_LOG_DIR"
 
-echo "queue=$STS_QUEUE select=$STS_SELECT walltime=$STS_WALLTIME group=${STS_GROUP:-<trial run>}"
-echo "config=$STS_CONFIG output=$STS_OUTPUT_DIR"
+echo "resource=$STS_RESOURCE=$STS_RESOURCE_COUNT  h_rt=$STS_H_RT  group=${STS_GROUP:-<trial run>}"
+echo "config=$STS_CONFIG  output=$STS_OUTPUT_DIR"
 echo
 
 for model in "${MODELS[@]}"; do
   # Everything the job needs, passed explicitly so the job script stays generic.
+  # Grid Engine's -v takes a comma-separated list; none of these values may
+  # contain a comma (paths do not).
   vars="STS_REPO=$STS_REPO"
   vars+=",STS_CONFIG=$STS_CONFIG"
   vars+=",STS_MODEL=$model"
@@ -56,17 +61,18 @@ for model in "${MODELS[@]}"; do
 
   args=(
     -N "sts-$model"
-    -q "$STS_QUEUE"
-    -l "select=$STS_SELECT"
-    -l "walltime=$STS_WALLTIME"
-    # A trailing slash makes PBS name the file itself: sts-<model>.o<jobid>.
-    # PBS does not expand $PBS_JOBID inside -o, so don't try to build the name.
+    -cwd
+    -l "${STS_RESOURCE}=${STS_RESOURCE_COUNT}"
+    -l "h_rt=$STS_H_RT"
+    # A trailing slash makes Grid Engine name the file itself:
+    # sts-<model>.o<jobid>. $JOB_ID is not expanded inside -o, so don't build
+    # the name here.
     -o "$STS_LOG_DIR/"
-    -j oe
+    -j y
     -v "$vars"
   )
-  # Omitting -P submits a trial run, which needs no group.
-  [[ -n "${STS_GROUP// }" ]] && args+=(-P "$STS_GROUP")
+  # Omitting -g submits a trial run, which needs no group.
+  [[ -n "${STS_GROUP// }" ]] && args+=(-g "$STS_GROUP")
   args+=("$HERE/job_sts.sh")
 
   if [[ -n "${DRY_RUN:-}" ]]; then
@@ -78,7 +84,7 @@ for model in "${MODELS[@]}"; do
 done
 
 echo
-echo "watch:   qstat -u \$USER          (or: qstat -f <jobid>)"
+echo "watch:   qstat -u \$USER          (details: qstat -j <jobid>)"
 echo "cancel:  qdel <jobid>"
 echo "logs:    $STS_LOG_DIR/"
 echo "merge:   python -m sts.cli report --config $STS_CONFIG --output-dir $STS_OUTPUT_DIR"
