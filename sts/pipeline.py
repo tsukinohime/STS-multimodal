@@ -38,6 +38,20 @@ PREDICTION_COLUMNS = (
     "sentence1_truncated", "sentence2_truncated", "pair_truncated",
 )
 
+#: Prediction columns the metric code recognises, in priority order. The
+#: embedding pipeline writes ``cosine_prediction``; the LLM-judge pipeline
+#: writes ``expected_score``. Both share every other column the metrics need.
+PREDICTION_COLUMN_CANDIDATES = ("expected_score", "cosine_prediction")
+
+
+def prediction_column_of(frame: pd.DataFrame) -> str:
+    for column in PREDICTION_COLUMN_CANDIDATES:
+        if column in frame.columns:
+            return column
+    raise KeyError(
+        f"no prediction column among {PREDICTION_COLUMN_CANDIDATES}; have {list(frame.columns)}"
+    )
+
 
 @dataclass
 class RunPaths:
@@ -173,14 +187,20 @@ def metric_rows(
     dataset_name: str,
     model_key: str,
     config: ExperimentConfig,
+    prediction_column: Optional[str] = None,
 ) -> List[Dict[str, object]]:
-    """Overall + per-domain correlation rows for one (model, dataset)."""
+    """Overall + per-domain correlation rows for one (model, dataset).
+
+    ``prediction_column`` defaults to whichever recognised column the frame
+    carries, so the same function scores cosine and LLM-judge predictions.
+    """
     settings = config.metrics
+    column = prediction_column or prediction_column_of(predictions)
     rows: List[Dict[str, object]] = []
 
     def add(domain: str, frame: pd.DataFrame) -> None:
         correlations = compute_correlations(
-            frame["cosine_prediction"].to_numpy(),
+            frame[column].to_numpy(),
             frame["gold_score"].to_numpy(),
             bootstrap=settings.bootstrap,
             seed=settings.bootstrap_seed,

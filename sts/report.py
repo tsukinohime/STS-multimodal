@@ -91,10 +91,30 @@ def _ci_suffix(row) -> str:
     return f" [{low:.3f}, {high:.3f}]"
 
 
+#: How each experiment type describes itself at the top of its summary.
+METHOD_TEXT = {
+    "embedding": (
+        "text-only zero-shot STS",
+        "Frozen pretrained encoders, L2-normalised embeddings, cosine similarity as the "
+        "prediction. No training, fine-tuning, regression, calibration or test-set tuning.",
+    ),
+    "judge": (
+        "LLM-as-judge zero-shot STS",
+        "A frozen instruction-tuned LLM is shown the pair with the dataset's own rating "
+        "guidelines and asked for a single digit; no chain-of-thought is allowed. The "
+        "prediction is the probability-weighted expectation over the allowed digit tokens "
+        "at the answer position, read from one forward pass — no text is generated. Nothing "
+        "is trained, calibrated or tuned on any split. Each dataset keeps its native scale "
+        "(Spearman is scale-invariant), and every prediction row carries the prompt hash.",
+    ),
+}
+
+
 def build_markdown_summary(
     metrics: pd.DataFrame,
     config: ExperimentConfig,
     manifest: Optional[dict] = None,
+    method: str = "embedding",
 ) -> str:
     manifest = manifest or {}
     resolved = manifest.get("resolved", {})
@@ -103,12 +123,12 @@ def build_markdown_summary(
     runs = manifest.get("runs", [])
     models_meta = manifest.get("models", {})
     datasets_meta = manifest.get("datasets", {})
+    title_suffix, method_text = METHOD_TEXT.get(method, METHOD_TEXT["embedding"])
 
     lines: List[str] = [
-        f"# {config.name} — text-only zero-shot STS",
+        f"# {config.name} — {title_suffix}",
         "",
-        "Frozen pretrained encoders, L2-normalised embeddings, cosine similarity as the "
-        "prediction. No training, fine-tuning, regression, calibration or test-set tuning.",
+        method_text,
         "",
         "## Run",
         "",
@@ -278,9 +298,10 @@ def write_summary(
     metrics: pd.DataFrame,
     config: ExperimentConfig,
     manifest: Optional[dict] = None,
+    method: str = "embedding",
 ) -> Path:
     path = config.tagged("summary", ".md")
-    path.write_text(build_markdown_summary(metrics, config, manifest), encoding="utf-8")
+    path.write_text(build_markdown_summary(metrics, config, manifest, method), encoding="utf-8")
     _log.info("Summary -> %s", path)
     return path
 

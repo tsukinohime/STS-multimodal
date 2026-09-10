@@ -134,30 +134,48 @@ def check_cxc_caption_mapping(config: ExperimentConfig) -> CheckResult:
 
 
 def check_predictions(output_dir: Path) -> CheckResult:
-    """No NaN in any written prediction, and cosine stays inside [-1, 1]."""
+    """No NaN in any written prediction, and every prediction is inside its range.
+
+    Cosine predictions must lie in [-1, 1]; LLM-judge expectations must lie
+    within the dataset's answer scale, which the judge writes into the CSV as
+    ``scale_min`` / ``scale_max``.
+    """
+    from .pipeline import prediction_column_of
+
     files = sorted((output_dir / "predictions").rglob("*.csv"))
     if not files:
         return CheckResult("predictions_have_no_nan", False, "no prediction files found")
 
     problems = []
     total = 0
+    ranges = set()
     for path in files:
         frame = pd.read_csv(path)
         total += len(frame)
-        n_nan_pred = int(frame["cosine_prediction"].isna().sum())
+        column = prediction_column_of(frame)
+        values = frame[column]
+        if column == "cosine_prediction":
+            low, high = -1.0, 1.0
+        else:
+            low = float(frame["scale_min"].iloc[0]) if "scale_min" in frame else float("-inf")
+            high = float(frame["scale_max"].iloc[0]) if "scale_max" in frame else float("inf")
+        ranges.add((low, high))
+        n_nan_pred = int(values.isna().sum())
         n_nan_gold = int(frame["gold_score"].isna().sum())
-        out_of_range = int((frame["cosine_prediction"].abs() > 1.0 + 1e-6).sum())
+        out_of_range = int(((values < low - 1e-6) | (values > high + 1e-6)).sum())
         if n_nan_pred or n_nan_gold or out_of_range:
             problems.append({
                 "file": str(path.relative_to(output_dir)),
+                "column": column,
                 "nan_predictions": n_nan_pred,
                 "nan_gold": n_nan_gold,
-                "cosine_out_of_range": out_of_range,
+                "out_of_range": out_of_range,
             })
+    range_text = ", ".join(f"[{lo:g}, {hi:g}]" for lo, hi in sorted(ranges))
     return CheckResult(
         name="predictions_have_no_nan",
         passed=not problems,
-        detail=f"{total} pair predictions across {len(files)} file(s), all finite and in [-1, 1]"
+        detail=f"{total} pair predictions across {len(files)} file(s), all finite and in {range_text}"
         if not problems else f"problems in {len(problems)} file(s)",
         data={"n_files": len(files), "n_pairs": total, "problems": problems},
     )

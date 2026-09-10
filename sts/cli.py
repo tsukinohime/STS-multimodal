@@ -1,6 +1,7 @@
 """Command-line entry point.
 
     python -m sts.cli run      --config configs/text_only.yaml
+    python -m sts.cli judge    --config configs/llm_judge.yaml
     python -m sts.cli validate --config configs/smoke.yaml
     python -m sts.cli align    --config configs/text_only.yaml \
                                --model-a jina-v5-text-small --model-b jina-v5-omni-small
@@ -35,7 +36,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dtype", default=None, help="override runtime.dtype")
     parser.add_argument("--batch-size", type=int, default=None, help="override runtime.batch_size")
     parser.add_argument("--limit", type=int, default=None, help="use only N pairs per dataset")
-    parser.add_argument("--models", nargs="+", default=None, help="run only these model keys")
+    parser.add_argument("--models", nargs="+", default=None, help="run only these model / judge keys")
     parser.add_argument("--datasets", nargs="+", default=None, help="run only these dataset names")
     parser.add_argument("--output-dir", type=Path, default=None, help="override experiment.output_dir")
     parser.add_argument("--data-root", type=Path, default=None, help="override data.root")
@@ -85,18 +86,15 @@ def _load_manifest(config: ExperimentConfig) -> dict:
     return merged
 
 
-def _finalise(metrics: pd.DataFrame, config: ExperimentConfig) -> pd.DataFrame:
+def _finalise(metrics: pd.DataFrame, config: ExperimentConfig, method: str = "embedding") -> pd.DataFrame:
     metrics = add_macro_average(metrics, config.metrics.macro_average_over)
     write_metrics(metrics, config)
-    write_summary(metrics, config, _load_manifest(config))
+    write_summary(metrics, config, _load_manifest(config), method=method)
     print_console_table(metrics)
     return metrics
 
 
-def command_run(args: argparse.Namespace) -> int:
-    from .pipeline import run_experiment
-
-    config = _config_from(args)
+def _apply_run_flags(config: ExperimentConfig, args: argparse.Namespace) -> None:
     if args.no_resume:
         config.resume = False
     if args.no_cache:
@@ -104,31 +102,71 @@ def command_run(args: argparse.Namespace) -> int:
     if args.bootstrap is not None:
         config.metrics.bootstrap = args.bootstrap
 
+
+def command_run(args: argparse.Namespace) -> int:
+    from .pipeline import run_experiment
+
+    config = _config_from(args)
+    _apply_run_flags(config, args)
     metrics = run_experiment(config)
     if metrics.empty:
         _log.error("No results produced.")
         return 1
-    _finalise(metrics, config)
+    _finalise(metrics, config, method="embedding")
+    return 0
+
+
+def command_judge(args: argparse.Namespace) -> int:
+    """LLM-as-judge: same datasets and outputs, a prompted LLM instead of an encoder."""
+    from .judge.pipeline import run_judge_experiment
+
+    config = _config_from(args)
+    _apply_run_flags(config, args)
+    if not config.enabled_judges:
+        _log.error("No enabled judges in %s (add a `judges:` list or check --models).", config.source_path)
+        return 1
+    metrics = run_judge_experiment(config)
+    if metrics.empty:
+        _log.error("No results produced.")
+        return 1
+    _finalise(metrics, config, method="judge")
     return 0
 
 
 def command_report(args: argparse.Namespace) -> int:
-    """Rebuild metrics and the summary from prediction CSVs already on disk."""
-    from .pipeline import metric_rows
+    """Rebuild metrics and the summary from prediction CSVs already on disk.
+
+    Works for both experiment types: the prediction column is detected per
+    file, and the summary header follows whichever kind of run was found.
+    """
+    from .pipeline import metric_rows, prediction_column_of
 
     config = _config_from(args)
+    keys = [m.key for m in config.enabled_models] + [j.key for j in config.enabled_judges]
     rows: List[dict] = []
-    for model_spec in config.enabled_models:
+    saw_judge = False
+    for key in keys:
         for name in config.datasets:
-            path = config.output_dir / "predictions" / model_spec.key / f"{name}.csv"
+            path = config.output_dir / "predictions" / key / f"{name}.csv"
             if not path.exists():
                 _log.warning("missing %s", path)
                 continue
-            rows.extend(metric_rows(pd.read_csv(path), name, model_spec.key, config))
+            frame = pd.read_csv(path)
+            column = prediction_column_of(frame)
+            if column == "expected_score":
+                saw_judge = True
+                n_all = len(frame)
+                frame = frame[frame[column].notna()]
+                extra = {"n_degenerate": n_all - len(frame)}
+            else:
+                extra = {}
+            for row in metric_rows(frame, name, key, config, prediction_column=column):
+                row.update(extra)
+                rows.append(row)
     if not rows:
         _log.error("No prediction files found under %s", config.output_dir / "predictions")
         return 1
-    _finalise(pd.DataFrame(rows), config)
+    _finalise(pd.DataFrame(rows), config, method="judge" if saw_judge else "embedding")
     return 0
 
 
@@ -223,6 +261,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--no-cache", action="store_true", help="bypass the embedding cache")
     run_parser.add_argument("--bootstrap", type=int, default=None, help="bootstrap resamples for the CI")
     run_parser.set_defaults(func=command_run)
+
+    judge_parser = subparsers.add_parser(
+        "judge", help="LLM-as-judge STS: prompt a chat model, take the expected digit"
+    )
+    _add_common(judge_parser)
+    judge_parser.add_argument("--no-resume", action="store_true", help="recompute even if predictions exist")
+    judge_parser.add_argument("--no-cache", action="store_true", help="bypass the judgment cache")
+    judge_parser.add_argument("--bootstrap", type=int, default=None, help="bootstrap resamples for the CI")
+    judge_parser.set_defaults(func=command_judge)
 
     report_parser = subparsers.add_parser("report", help="rebuild metrics/summary from existing predictions")
     _add_common(report_parser)

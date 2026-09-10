@@ -1,0 +1,28 @@
+# Extra requirements for the LLM-as-judge experiment (configs/llm_judge.yaml).
+#
+# Apply to an EXISTING venv that already satisfies requirements.txt:
+#
+#     source <venv>/bin/activate
+#     pip install --upgrade -r requirements-judge.txt
+#     python -c "import transformers; print(transformers.__version__)"   # must be >= 5.16
+#
+# The first line pulls requirements.txt in, so this file is the only one to pass.
+-r requirements.txt
+
+# Qwen3.5 MoE (model_type qwen3_5_moe) landed in transformers 5.16.0. Earlier
+# 5.x cannot even parse its config.
+transformers>=5.16
+
+# `device_map="cuda"` streams the ~70 GB bf16 checkpoint straight onto the GPU
+# instead of staging it through host RAM.
+accelerate>=1.0
+
+# ---------------------------------------------------------------------------
+# Optional. 30 of the judge's 40 layers are gated-DeltaNet linear attention;
+# transformers uses these CUDA kernels when present and a pure-torch
+# implementation otherwise. The fallback is correct, just slower, and needs no
+# compiler — so nothing here is required. Both build against CUDA; only try
+# them on a compute node with the matching CUDA toolkit loaded.
+#   flash-linear-attention
+#   causal-conv1d
+# ---------------------------------------------------------------------------

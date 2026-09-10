@@ -1,0 +1,102 @@
+# =============================================================================
+# LLM-as-judge zero-shot STS.
+#
+# Same datasets, splits, categories, seed, outputs and metrics as the text-only
+# embedding baseline (configs/text_only.yaml); only the scorer changes: a frozen
+# chat LLM is shown each pair with the dataset's OWN rating guidelines and asked
+# for a single digit. The prediction is the probability-weighted expectation
+# over the allowed digit tokens at the answer position, read from ONE forward
+# pass — no text is generated, no chain-of-thought, no calibration.
+#
+# Why the expectation: an argmax digit yields at most 6 distinct values across
+# 44k CxC pairs, i.e. massive rank ties. E[score] is continuous. Both are
+# recorded so the difference is visible in the manifest.
+#
+# Scales are per dataset because the anchors only exist on their native scale
+# (CxC 0–5, SICK 1–5, STS3k 1–7). Spearman is scale-invariant, so this does not
+# affect comparability across datasets. Changing a scale means a new prompt
+# version in sts/judge/prompts.py, which changes the prompt hash on purpose.
+#
+#   python -m sts.cli judge --config configs/llm_judge.yaml
+# =============================================================================
+
+experiment:
+  name: llm_judge_text_only
+  output_dir: outputs/llm_judge
+  seed: 42
+  resume: true
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: auto
+  dtype: auto             # bfloat16 on cuda
+  batch_size: 16          # prompts per forward pass; lower on OOM
+  max_length: 512         # unused by the judge (prompts are never truncated); kept for schema
+  cache_dir: .cache/judgments
+  use_cache: true
+  flush_every: 512        # judged pairs between cache flushes = resume granularity
+  progress: true
+  seed: 42
+
+# -----------------------------------------------------------------------------
+# Judges. One forward pass per pair; the answer is read from the next-token
+# distribution, so batch_size trades GPU memory for throughput only.
+#
+# Qwen3.5-35B-A3B: 35B total / 3B active MoE, 256 experts (8 routed + 1 shared),
+# hybrid attention (30 gated-DeltaNet + 10 full-attention layers). bf16 weights
+# are ~70 GB — fits one H100 with room for short prompts. Thinking mode is ON by
+# default for this model; enable_thinking=false makes the chat template close
+# the <think> block immediately so the digit is the very next token.
+# -----------------------------------------------------------------------------
+judges:
+  - key: qwen3.5-35b-a3b
+    model_id: Qwen/Qwen3.5-35B-A3B
+    backend: hf
+    prompt_set: v1
+    enable_thinking: false        # hard requirement: no CoT
+    symmetrize: false             # true = also score (b, a) and average; 2x cost
+    symmetry_check_sample: 256    # pairs re-scored swapped, per dataset, as a diagnostic
+    min_valid_mass: 0.05          # digit-token mass below this -> answer NaN, counted degenerate
+    batch_size: 16
+    max_prompt_tokens: 1024       # flagged if exceeded; never truncated
+    trust_remote_code: false      # architecture is native to transformers >= 5.16
+    enabled: true
+    notes: "Main judge. Needs transformers >= 5.16 (see requirements-judge.txt)."
+
+  # Tiny stand-in that runs on a laptop; same tokenizer digit ids as Qwen3.5.
+  - key: qwen2.5-0.5b-stub
+    model_id: Qwen/Qwen2.5-0.5B-Instruct
+    backend: hf
+    prompt_set: v1
+    enable_thinking: false
+    symmetry_check_sample: 64
+    batch_size: 16
+    enabled: false
+    notes: "Pipeline-exercise judge only; its scores are not meaningful."
+
+# No encoders in this experiment.
+models: []
+
+metrics:
+  bootstrap: 0
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  macro_average_over:
+    - cxc-val
+    - cxc-test
+    - sick-test
+    - sts3k

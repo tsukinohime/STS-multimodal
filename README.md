@@ -210,6 +210,80 @@ Useful flags: `--limit N`, `--device {auto,cuda,mps,cpu}`, `--dtype`,
 | embeddings | full 1024 dim, L2-normalised | no Matryoshka truncation |
 | seed | 42 | governs subsampling and the metric bootstrap; inference itself is deterministic |
 
+## LLM-as-judge experiment
+
+The second text-only baseline keeps everything above — datasets, splits,
+categories, seed, outputs, metrics — and swaps the scorer: a frozen chat LLM
+is shown each pair together with the dataset's **own** rating guidelines and
+asked for a single digit.
+
+```bash
+python -m sts.cli judge --config configs/llm_judge.yaml                 # full run
+python scripts/smoke_test.py --config configs/llm_judge_smoke.yaml --judge   # 32 pairs, laptop
+python -m sts.cli report --config configs/llm_judge.yaml                # rebuild summary
+```
+
+**Scoring.** No text is generated. The chat template is rendered up to the
+assistant's first token (thinking disabled, so nothing precedes it) and the
+next-token distribution at that position is read for the allowed digits:
+
+```
+E[score] = Σ_d d · p(d) / Σ_d p(d)
+```
+
+An argmax digit gives at most 6 distinct values across 44k CxC pairs — massive
+rank ties. The expectation is continuous. Both are recorded (`expected_score`,
+`argmax_score`), plus the per-digit probabilities, the total mass the model put
+on valid digits (`valid_mass`), and the mass on a leading space. Rows whose
+digit mass falls below `min_valid_mass` are NaN, counted as degenerate, and
+excluded from the correlation rather than silently trusted.
+
+**Prompts** live in [sts/judge/prompts.py](sts/judge/prompts.py), one spec per
+dataset family, and follow four rules:
+
+1. *Scale and anchors are copied verbatim from the original annotation
+   guidelines* — never invented. Each spec records its source.
+   - CxC: the six STS definitions from the CxC paper appendix (Cer et al.
+     2017 / Agirre et al. 2012), scale 0–5.
+   - SICK: Marelli et al. 2014 describe the task only through one example
+     pair per endpoint ("completely unrelated" / "very related"), explicitly
+     *avoiding* strict definitions; the prompt does the same. Scale 1–5.
+   - STS3k: Fodor et al. 2025, appendix 8.2.1, verbatim; the authors gave
+     participants no rating framework on purpose. Scale 1–7.
+2. *Symmetric wording*: the question is always about "the two sentences";
+   neither sentence is the subject or object of the comparison.
+3. *No chain-of-thought*: the answer is one digit, nothing else, and the
+   template's thinking mode is switched off.
+4. *Hashed*: `prompt_hash` = spec + chat template. It is in every prediction
+   row, in the manifest, and in `outputs/<exp>/prompts/<family>__<version>__<hash>.md`
+   together with a fully rendered example, so any later prompt edit is
+   traceable. Changing a scale means a new spec version — and a new hash.
+
+Scales therefore differ per dataset. Spearman is invariant to the scale, so
+this costs nothing for the comparison across datasets or against the embedding
+baseline.
+
+**Diagnostics per (judge, dataset)**, recorded in the manifest: Spearman of the
+expectation next to Spearman of the argmax (what the weighting buys), the
+argmax histogram and largest tie fraction, digit-mass statistics, and an
+*order-symmetry check* — a sample re-scored with the two sentences swapped,
+reported as mean |Δ| and the Spearman between orders. A symmetric prompt does
+not make an LLM order-invariant; this measures how far off it is. Set
+`symmetrize: true` to score both orders for every pair and average (2× cost).
+
+**Judge**: `Qwen/Qwen3.5-35B-A3B` — 35B-parameter MoE with 3B active, hybrid
+gated-DeltaNet / full attention, 262k context, thinking mode on by default
+(disabled here). bf16 weights are ~70 GB; one H100 suffices for prefill-only
+scoring. Requires `transformers >= 5.16`:
+
+```bash
+pip install --upgrade -r requirements-judge.txt     # into the existing venv
+```
+
+The judgment cache reuses the embedding cache machinery (`.cache/judgments/`),
+keyed by ordered pair text and the prompt hash, so a killed job resumes and a
+prompt edit never reuses stale answers.
+
 ## Outputs
 
 Written to `experiment.output_dir` (default `outputs/text_only/`):
@@ -333,9 +407,13 @@ sts/
   report.py        metrics CSV/JSON + markdown summary
   diagnostics.py   validation checks + cross-model alignment probe
   cli.py           command-line entry point
+  judge/           LLM-as-judge: prompts.py (specs + hashes), scorer.py
+                   (next-token expectation), pipeline.py (orchestration)
 configs/
-  text_only.yaml   the full experiment
+  text_only.yaml   the full embedding experiment
   smoke.yaml       32 pairs/dataset, laptop-sized
+  llm_judge.yaml   the full LLM-as-judge experiment
+  llm_judge_smoke.yaml   its 32-pair smoke test (0.5B stand-in judge)
 scripts/
   smoke_test.py    run twice + validate everything
 tsubame/

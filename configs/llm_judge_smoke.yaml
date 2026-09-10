@@ -1,0 +1,77 @@
+# =============================================================================
+# 32-pair smoke test for the LLM-as-judge pipeline, laptop-sized.
+#
+#   python scripts/smoke_test.py --config configs/llm_judge_smoke.yaml --judge
+#
+# Uses Qwen2.5-0.5B-Instruct: same digit token ids as Qwen3.5, no thinking
+# switch in its template (the digit is simply the first assistant token). Its
+# scores mean nothing; the point is to exercise every code path and check.
+# To smoke-test the real judge instead: --models qwen3.5-35b-a3b (needs a GPU
+# with ~75 GB free and the weights prefetched).
+# =============================================================================
+
+experiment:
+  name: llm_judge_smoke
+  output_dir: outputs/llm_judge_smoke
+  seed: 42
+  limit: 32
+  resume: false
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: auto
+  dtype: auto
+  batch_size: 8
+  max_length: 512
+  cache_dir: .cache/judgments
+  use_cache: true
+  flush_every: 16
+  progress: true
+  seed: 42
+
+judges:
+  - key: qwen2.5-0.5b-stub
+    model_id: Qwen/Qwen2.5-0.5B-Instruct
+    backend: hf
+    prompt_set: v1
+    enable_thinking: false
+    symmetrize: false
+    symmetry_check_sample: 16
+    min_valid_mass: 0.05
+    batch_size: 8
+    enabled: true
+
+  - key: qwen3.5-35b-a3b
+    model_id: Qwen/Qwen3.5-35B-A3B
+    backend: hf
+    prompt_set: v1
+    enable_thinking: false
+    symmetry_check_sample: 16
+    batch_size: 8
+    enabled: false
+
+models: []
+
+metrics:
+  bootstrap: 200
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  macro_average_over:
+    - cxc-val
+    - cxc-test
+    - sick-test
+    - sts3k

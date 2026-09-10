@@ -166,6 +166,41 @@ class ModelSpec:
 
 
 @dataclass
+class JudgeSpec:
+    """One frozen chat LLM used as a pairwise similarity rater (LLM-as-judge).
+
+    The judge never generates text: the prediction is the probability-weighted
+    expectation over the allowed digit tokens at the answer position. See
+    :mod:`sts.judge`.
+    """
+
+    key: str
+    model_id: str
+    backend: str = "hf"                 # only the transformers backend for now
+    prompt_set: str = "v1"              # which sts.judge.prompts.PROMPT_SETS entry
+    enable_thinking: bool = False       # must stay False: no chain-of-thought
+    symmetrize: bool = False            # also score (b, a) and average — doubles cost
+    symmetry_check_sample: int = 256    # pairs re-scored in swapped order as a diagnostic
+    min_valid_mass: float = 0.05        # below this digit-token mass the answer is degenerate (NaN)
+    batch_size: Optional[int] = None    # overrides RuntimeConfig.batch_size
+    max_prompt_tokens: int = 1024       # flagged, never truncated
+    dtype: Optional[str] = None
+    trust_remote_code: bool = False
+    enabled: bool = True
+    notes: str = ""
+
+    def fingerprint(self) -> Dict[str, Any]:
+        """Settings that change a judgment; the prompt hash is added at run time."""
+        return {
+            "model_id": self.model_id,
+            "backend": self.backend,
+            "prompt_set": self.prompt_set,
+            "enable_thinking": self.enable_thinking,
+            "dtype": self.dtype,
+        }
+
+
+@dataclass
 class MetricsConfig:
     bootstrap: int = 0          # 0 disables; 1000 gives the pair-level 95% CI
     bootstrap_seed: int = 12345
@@ -186,6 +221,7 @@ class ExperimentConfig:
     limit: Optional[int] = None
     resume: bool = True
     models: List[ModelSpec] = field(default_factory=list)
+    judges: List[JudgeSpec] = field(default_factory=list)
     data: DataPaths = field(default_factory=DataPaths)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
@@ -203,6 +239,16 @@ class ExperimentConfig:
     @property
     def enabled_models(self) -> List[ModelSpec]:
         return [m for m in self.models if m.enabled]
+
+    @property
+    def enabled_judges(self) -> List[JudgeSpec]:
+        return [j for j in self.judges if j.enabled]
+
+    def judge_by_key(self, key: str) -> JudgeSpec:
+        for judge in self.judges:
+            if judge.key == key:
+                return judge
+        raise KeyError(f"no judge with key {key!r}; have {[j.key for j in self.judges]}")
 
     def model_by_key(self, key: str) -> ModelSpec:
         for model in self.models:
@@ -242,6 +288,7 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
     runtime_raw = raw.get("runtime", {}) or {}
     metrics_raw = raw.get("metrics", {}) or {}
     models_raw = raw.get("models", []) or []
+    judges_raw = raw.get("judges", []) or []
 
     data = DataPaths(
         root=_expand(data_raw.get("root", REPO_ROOT / "data" / "raw"), base),
@@ -268,8 +315,21 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
         if unknown:
             raise ValueError(f"model {entry['key']!r}: unknown keys {sorted(unknown)}")
         models.append(ModelSpec(**entry))
-    if not models:
-        raise ValueError(f"{path}: no models defined")
+
+    judges: List[JudgeSpec] = []
+    for entry in judges_raw:
+        entry = dict(entry)
+        entry.setdefault("key", entry.get("model_id", "judge").split("/")[-1])
+        unknown = set(entry) - set(JudgeSpec.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"judge {entry['key']!r}: unknown keys {sorted(unknown)}")
+        judges.append(JudgeSpec(**entry))
+
+    if not models and not judges:
+        raise ValueError(f"{path}: no models or judges defined")
+    clash = {m.key for m in models} & {j.key for j in judges}
+    if clash:
+        raise ValueError(f"{path}: keys used by both a model and a judge: {sorted(clash)}")
 
     config = ExperimentConfig(
         name=experiment.get("name", "text_only_baseline"),
@@ -278,6 +338,7 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
         limit=experiment.get("limit"),
         resume=bool(experiment.get("resume", True)),
         models=models,
+        judges=judges,
         data=data,
         runtime=runtime,
         metrics=metrics,
@@ -303,12 +364,16 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
             # per-file paths the YAML set relative to the old one.
             config.data = DataPaths(root=Path(value))
         elif field_name == "models":
+            # One flag selects among encoders and judges alike.
             wanted = set(value)
-            missing = wanted - {m.key for m in config.models}
+            known = {m.key for m in config.models} | {j.key for j in config.judges}
+            missing = wanted - known
             if missing:
-                raise ValueError(f"--models: no such model key(s) {sorted(missing)}")
+                raise ValueError(f"--models: no such model/judge key(s) {sorted(missing)}")
             for model in config.models:
                 model.enabled = model.key in wanted
+            for judge in config.judges:
+                judge.enabled = judge.key in wanted
         elif hasattr(config, field_name):
             setattr(config, field_name, value)
         else:
