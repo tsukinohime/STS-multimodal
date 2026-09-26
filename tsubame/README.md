@@ -124,24 +124,26 @@ quota is small and the HF cache alone is several GB.
 ## LLM-as-judge: direct qsub submission
 
 `job_judge.sh` runs the real judge from `configs/llm_judge.yaml` in either
-small-sample or full mode. It defaults to `node_q=1` (one whole GPU, 192 GB
-host RAM) and a one-hour time limit. TSUBAME4 uses the resource names `node_q`
+small-sample or full mode. Choose the GPU resource with `qsub -l` when
+submitting; the script only defaults the time limit to one hour.
+TSUBAME4 uses the resource names `node_q`
 and `gpu_1` for whole-GPU allocations; `node_o` and `gpu_h` are half-GPU MIG
 allocations and cannot hold the current 35B judge's bf16 weights. See the
 [current resource table](https://www.t4.cii.isct.ac.jp/docs/handbook.en/jobs/#511-resource-types).
 
 From the **repository root on a login node**, activate your prepared Python
-environment, then submit one of these commands (replace `<group>`):
+environment, then submit one of these commands (replace `<group>` and
+`<resource>=<count>` with your chosen group and resource allocation):
 
 ```bash
 # Real-model smoke run: 32 pairs per configured dataset.
-qsub -g <group> -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh smoke
+qsub -g <group> -l <resource>=<count> -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh smoke
 
 # Larger smoke run: 128 pairs per dataset.
-qsub -g <group> -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh smoke 128
+qsub -g <group> -l <resource>=<count> -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh smoke 128
 
 # Full experiment; four hours is a walltime limit, not an estimated duration.
-qsub -g <group> -l h_rt=4:00:00 -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh full
+qsub -g <group> -l <resource>=<count> -l h_rt=4:00:00 -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh full
 ```
 
 `STS_PYTHON` selects the same interpreter you just activated, without relying
@@ -172,7 +174,7 @@ settings: existing prediction CSVs are reused without checking those changes.
 Optional paths can be passed in the same `-v` argument, for example:
 
 ```bash
-qsub -g <group> \
+qsub -g <group> -l <resource>=<count> \
   -v STS_PYTHON="$(command -v python)",STS_DATA_ROOT=/work/your/data/raw \
   tsubame/job_judge.sh smoke
 ```

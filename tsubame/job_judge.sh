@@ -1,13 +1,12 @@
 #!/bin/bash
 # Run from the repository root. Both modes use configs/llm_judge.yaml.
-#   qsub -g <group> -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh smoke
-#   qsub -g <group> -l h_rt=4:00:00 -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh full
+#   qsub -g <group> -l <resource>=<count> -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh smoke
+#   qsub -g <group> -l <resource>=<count> -l h_rt=4:00:00 -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh full
 # STS_PYTHON selects an already prepared interpreter. When omitted, use the
 # existing tsubame/activate_env.sh and its env.sh configuration instead.
-# Request a whole GPU: a half-GPU MIG instance cannot hold the bf16 35B weights.
+# Choose the GPU resource explicitly with qsub -l when submitting.
 #$ -cwd
 #$ -N sts-judge
-#$ -l node_q=1
 #$ -l h_rt=1:00:00
 #$ -j y
 
@@ -15,7 +14,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: qsub -g <group> [qsub options] tsubame/job_judge.sh [smoke [N] | full]
+Usage: qsub -g <group> -l <resource>=<count> [qsub options] tsubame/job_judge.sh [smoke [N] | full]
 
   smoke [N]  Score N pairs per dataset (default: 32). Recompute predictions
              without reading or writing the judgment cache.
@@ -34,7 +33,8 @@ Optional environment variables (pass with qsub -v):
   STS_JUDGE_CACHE_DIR    Judgment cache (default: .cache/judgments in the repo).
 
 Batch size is taken from the judge's YAML entry. STS_BATCH_SIZE is not used.
-The default allocation is node_q=1 for one hour; qsub -l overrides it.
+No GPU resource is requested by this script; specify it with qsub -l.
+The default time limit is one hour; qsub -l h_rt=... overrides it.
 EOF
 }
 
