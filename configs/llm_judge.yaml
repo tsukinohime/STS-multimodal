@@ -63,7 +63,7 @@ runtime:
 # -----------------------------------------------------------------------------
 judges:
   - key: qwen3.5-35b-a3b
-    model_id: Qwen/Qwen3.5-35B-A3B
+    model_id: /gs/fs/tga-kiban-arase/zhu/models/Qwen3.5-35B-A3B
     backend: hf
     prompt_set: v1
     enable_thinking: false        # hard requirement: no CoT
