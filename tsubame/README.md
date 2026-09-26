@@ -121,7 +121,78 @@ Keep `STS_DATA_ROOT`, `STS_OUTPUT_DIR`, `STS_CACHE_DIR` and `HF_HOME` on group
 storage (`/gs/bs/<group>/…` or `/gs/fs/<group>/…`), not in `$HOME` — the home
 quota is small and the HF cache alone is several GB.
 
-## Run
+## LLM-as-judge: direct qsub submission
+
+`job_judge.sh` runs the real judge from `configs/llm_judge.yaml` in either
+small-sample or full mode. It defaults to `node_q=1` (one whole GPU, 192 GB
+host RAM) and a one-hour time limit. TSUBAME4 uses the resource names `node_q`
+and `gpu_1` for whole-GPU allocations; `node_o` and `gpu_h` are half-GPU MIG
+allocations and cannot hold the current 35B judge's bf16 weights. See the
+[current resource table](https://www.t4.cii.isct.ac.jp/docs/handbook.en/jobs/#511-resource-types).
+
+From the **repository root on a login node**, activate your prepared Python
+environment, then submit one of these commands (replace `<group>`):
+
+```bash
+# Real-model smoke run: 32 pairs per configured dataset.
+qsub -g <group> -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh smoke
+
+# Larger smoke run: 128 pairs per dataset.
+qsub -g <group> -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh smoke 128
+
+# Full experiment; four hours is a walltime limit, not an estimated duration.
+qsub -g <group> -l h_rt=4:00:00 -v STS_PYTHON="$(command -v python)" tsubame/job_judge.sh full
+```
+
+`STS_PYTHON` selects the same interpreter you just activated, without relying
+on the batch shell to inherit Conda or venv activation. This route bypasses
+`env.sh` and `activate_env.sh`; use it for a self-contained Python environment.
+If your environment needs site modules or activation hooks, configure those in
+`tsubame/env.sh` and **omit `-v STS_PYTHON=...`** to use the shared bootstrap.
+
+Both modes keep the model path, prompts, datasets, seed, and metrics from the
+same formal YAML. Set the main judge's `model_id` there to your local model
+directory. Batch size comes from the YAML judge entry; this script does not
+pass `STS_BATCH_SIZE`, which would not override that entry anyway.
+
+| Mode | Behavior | Default output directory |
+|------|----------|--------------------------|
+| `smoke` or no argument | 32 pairs/dataset, fresh inference with `--no-resume --no-cache` | `outputs/llm_judge/smoke_32/` |
+| `smoke N` | N pairs/dataset, same fresh-inference behavior | `outputs/llm_judge/smoke_N/` |
+| `full` | All pairs, honoring the YAML's resume/cache settings | `outputs/llm_judge/full/` |
+
+Smoke mode exercises the pipeline; it does not run the assertions in
+`scripts/smoke_test.py`. It never clears or writes the full run's judgment
+cache. Full mode uses `.cache/judgments/` and can be resumed by submitting the
+same command with the same config and data. Each submission's manifest,
+metrics, and summary carry the scheduler job ID, preserving earlier records.
+Use a new `STS_JUDGE_OUTPUT_ROOT` when changing data, prompts, or scoring
+settings: existing prediction CSVs are reused without checking those changes.
+
+Optional paths can be passed in the same `-v` argument, for example:
+
+```bash
+qsub -g <group> \
+  -v STS_PYTHON="$(command -v python)",STS_DATA_ROOT=/work/your/data/raw \
+  tsubame/job_judge.sh smoke
+```
+
+Other optional variables are `STS_REPO`, `STS_JUDGE_CONFIG`,
+`STS_JUDGE_OUTPUT_ROOT` (the script appends `smoke_N` or `full`), and
+`STS_JUDGE_CACHE_DIR`. Run `bash tsubame/job_judge.sh --help` for details.
+Judge-specific defaults do not use the embedding experiment's
+`STS_CONFIG`, `STS_OUTPUT_DIR`, or `STS_CACHE_DIR` settings.
+
+Watch with `qstat -u "$USER"` and `tail -f sts-judge.o<jobid>` in the submission
+directory. The log first prints the GPU memory visible to PyTorch, then the
+exact experiment command. After completion, results are in the mode's output
+directory. To rebuild the full report without GPU inference:
+
+```bash
+python -m sts.cli report --config configs/llm_judge.yaml --output-dir outputs/llm_judge/full
+```
+
+## Run (embedding)
 
 ```bash
 # Sanity check on a small allocation first (32 pairs/dataset, minutes).
