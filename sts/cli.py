@@ -6,6 +6,8 @@
     python -m sts.cli align    --config configs/text_only.yaml \
                                --model-a jina-v5-text-small --model-b jina-v5-omni-small
     python -m sts.cli report   --config configs/text_only.yaml
+    python -m sts.cli breakdown --config configs/llm_judge.yaml --datasets sick-all \
+                                --baseline outputs/text_only
     python -m sts.cli datasets
 
 Every run is fully described by its YAML file; the flags below only exist to
@@ -170,6 +172,25 @@ def command_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_breakdown(args: argparse.Namespace) -> int:
+    """SICK results split by NLI label, from prediction CSVs already on disk."""
+    from .breakdown import run_breakdown
+
+    config = _config_from(args)
+    datasets = [name for name in config.datasets if name.startswith("sick-")]
+    if not datasets:
+        _log.error("No SICK dataset among %s (pass --datasets sick-all or sick-test).", config.datasets)
+        return 1
+    written = run_breakdown(
+        config, datasets,
+        baselines=args.baseline or [],
+        baseline_models=args.baseline_models,
+        label_column=args.label_column,
+        per_label=args.worst,
+    )
+    return 0 if written else 1
+
+
 def command_validate(args: argparse.Namespace) -> int:
     from .diagnostics import print_validation, run_validation, write_validation_report
 
@@ -274,6 +295,22 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser = subparsers.add_parser("report", help="rebuild metrics/summary from existing predictions")
     _add_common(report_parser)
     report_parser.set_defaults(func=command_report)
+
+    breakdown_parser = subparsers.add_parser(
+        "breakdown", help="SICK results split by NLI label, from existing predictions (no model loaded)"
+    )
+    _add_common(breakdown_parser)
+    breakdown_parser.add_argument("--baseline", type=Path, action="append", default=None,
+                                  help="another experiment's output dir; its predictions/<model>/ "
+                                       "files are compared too (repeatable)")
+    breakdown_parser.add_argument("--baseline-models", nargs="+", default=None,
+                                  help="only these model keys from the --baseline dirs")
+    breakdown_parser.add_argument("--label-column", default="entailment_label",
+                                  choices=["entailment_label", "entailment_AB", "entailment_BA"],
+                                  help="SICK column to stratify by")
+    breakdown_parser.add_argument("--worst", type=int, default=10,
+                                  help="pairs per (system, label) in the worst-pairs CSV")
+    breakdown_parser.set_defaults(func=command_breakdown)
 
     validate_parser = subparsers.add_parser("validate", help="run the correctness checks")
     _add_common(validate_parser)

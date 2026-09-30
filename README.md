@@ -284,6 +284,31 @@ The judgment cache reuses the embedding cache machinery (`.cache/judgments/`),
 keyed by ordered pair text and the prompt hash, so a killed job resumes and a
 prompt edit never reuses stale answers.
 
+### SICK by NLI label
+
+`breakdown` splits SICK results by the pair's entailment label
+(`ENTAILMENT` / `NEUTRAL` / `CONTRADICTION`). It reads the prediction CSVs
+already on disk and loads no model, so it reproduces the original run's
+numbers exactly. Any other experiment's output directory can be added as a
+baseline, which puts the judge and an encoder side by side on the same pairs:
+
+```bash
+python -m sts.cli breakdown --config configs/llm_judge.yaml --datasets sick-all sick-test \
+    --baseline outputs/text_only --baseline-models jina-v5-omni-small
+```
+
+Per system and label: Spearman/Pearson within the label, the pooled Spearman
+with that label left out, the mean rank offset rank(pred) − rank(gold) (where a
+label sits relative to the annotators), the label's share of the squared rank
+error, and, for a judge, its mean score next to the gold mean on the same 1–5
+scale. Also per system: the pooled Spearman with each label's mean offset
+removed. This is a diagnostic that uses the labels, and its gain over the plain value is
+the correlation lost to whole labels sitting at the wrong height. Written to
+`<output_dir>/breakdown/<dataset>__<label>.{csv,md}`, plus `__worst.csv` with the
+pairs each system ranks furthest from gold, per label, next to every other
+system's rank for the same pair. `--label-column entailment_AB|entailment_BA`
+uses the directional labels instead.
+
 ## Outputs
 
 Written to `experiment.output_dir` (default `outputs/text_only/`):
@@ -406,6 +431,7 @@ sts/
   manifest.py      reproducibility record
   report.py        metrics CSV/JSON + markdown summary
   diagnostics.py   validation checks + cross-model alignment probe
+  breakdown.py     SICK results split by NLI label, from predictions on disk
   cli.py           command-line entry point
   judge/           LLM-as-judge: prompts.py (specs + hashes), scorer.py
                    (next-token expectation), pipeline.py (orchestration)

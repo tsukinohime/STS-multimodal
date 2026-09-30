@@ -6,7 +6,9 @@
 (FLICKR | SEMEVAL — the corpus each sentence was drawn from), which becomes the
 pair ``domain``.
 
-The entailment labels are ignored: this project scores relatedness only.
+The entailment labels are not part of the pair table: this project scores
+relatedness only. :func:`load_sick_labels` exposes them, keyed by the same
+``pair_id``, for the post-hoc breakdown in :mod:`sts.breakdown`.
 
 ``split="test"`` reproduces the standard SICK-R benchmark; ``split="all"``
 covers every pair in the file. Both are reported, and note that they overlap —
@@ -16,7 +18,7 @@ covers every pair in the file. Both are reported, and note that they overlap —
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
+from typing import Tuple, Union
 
 import pandas as pd
 
@@ -25,6 +27,9 @@ from ..config import get_logger
 from .base import STSDataset, STSPair, clean_text
 
 _SPLIT_MAP = {"train": "TRAIN", "trial": "TRIAL", "test": "TEST"}
+#: Per-pair NLI annotations shipped with SICK. ``entailment_label`` is the
+#: pair-level gold label; ``entailment_AB`` / ``entailment_BA`` are directional.
+NLI_COLUMNS = ("entailment_label", "entailment_AB", "entailment_BA")
 _log = get_logger()
 
 
@@ -38,8 +43,8 @@ def _pair_domain(dataset_a: str, dataset_b: str) -> str:
     return a if a == b else "+".join(sorted((a, b)))
 
 
-def load_sick(path: Union[str, Path], split: str = "test") -> STSDataset:
-    path = Path(path)
+def _read_split(path: Path, split: str) -> Tuple[pd.DataFrame, int]:
+    """The rows of ``split`` plus the row count of the whole file."""
     if not archive.exists(path):
         raise FileNotFoundError(f"SICK file not found: {path}")
 
@@ -50,13 +55,19 @@ def load_sick(path: Union[str, Path], split: str = "test") -> STSDataset:
         raise ValueError(f"{path} is missing columns: {sorted(missing_columns)}")
 
     n_rows_in_file = len(frame)
-    split = split.lower()
     if split != "all":
         if split not in _SPLIT_MAP:
             raise ValueError(f"unknown SICK split {split!r}; use all/train/trial/test")
         if "SemEval_set" not in frame.columns:
             raise ValueError(f"{path} has no 'SemEval_set' column; only split='all' is possible")
         frame = frame[frame["SemEval_set"] == _SPLIT_MAP[split]]
+    return frame, n_rows_in_file
+
+
+def load_sick(path: Union[str, Path], split: str = "test") -> STSDataset:
+    path = Path(path)
+    split = split.lower()
+    frame, n_rows_in_file = _read_split(path, split)
 
     has_domain = {"sentence_A_dataset", "sentence_B_dataset"} <= set(frame.columns)
     name = f"sick-{split}"
@@ -94,3 +105,20 @@ def load_sick(path: Union[str, Path], split: str = "test") -> STSDataset:
             "n_rows_in_file": n_rows_in_file,
         },
     )
+
+
+def load_sick_labels(
+    path: Union[str, Path], split: str = "all", column: str = "entailment_label"
+) -> pd.Series:
+    """One NLI annotation per pair, indexed by the ``pair_id`` :func:`load_sick` assigns."""
+    if column not in NLI_COLUMNS:
+        raise ValueError(f"unknown SICK label column {column!r}; use one of {NLI_COLUMNS}")
+    path = Path(path)
+    split = split.lower()
+    frame, _ = _read_split(path, split)
+    if column not in frame.columns:
+        raise ValueError(f"{path} has no {column!r} column")
+    labels = frame[column].astype(str).str.strip()
+    labels.index = [f"sick-{split}-{pair_id}" for pair_id in frame["pair_ID"]]
+    labels.name = column
+    return labels

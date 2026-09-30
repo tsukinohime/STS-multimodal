@@ -194,6 +194,17 @@ directory. To rebuild the full report without GPU inference:
 python -m sts.cli report --config configs/llm_judge.yaml --output-dir outputs/llm_judge/full
 ```
 
+To split SICK by NLI label against the embedding run, also without a GPU
+(add `--data-root "$STS_DATA_ROOT"` if the judge job was given one):
+
+```bash
+python -m sts.cli breakdown --config configs/llm_judge.yaml --output-dir outputs/llm_judge/full \
+    --datasets sick-all sick-test \
+    --baseline outputs/text_only --baseline-models jina-v5-omni-small
+```
+
+Tables go to `outputs/llm_judge/full/breakdown/`.
+
 ## Run (embedding)
 
 ```bash
