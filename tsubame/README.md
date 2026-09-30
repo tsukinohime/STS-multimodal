@@ -194,16 +194,25 @@ directory. To rebuild the full report without GPU inference:
 python -m sts.cli report --config configs/llm_judge.yaml --output-dir outputs/llm_judge/full
 ```
 
-To split SICK by NLI label against the embedding run, also without a GPU
-(add `--data-root "$STS_DATA_ROOT"` if the judge job was given one):
+### Breakdown by category (CPU job)
+
+`job_breakdown.sh` splits the full judge run against the embedding run in one
+job: SICK by NLI label, and CxC by `sampling_method` (`c2c_cocaption` /
+`c2c_isim`). It reads prediction CSVs only and needs no GPU. Locally it takes
+seconds and peaks at about 1.2 GB (the COCO caption index), so request the
+smallest CPU-only resource type in the
+[resource table](https://www.t4.cii.isct.ac.jp/docs/handbook.en/jobs/#511-resource-types):
 
 ```bash
-python -m sts.cli breakdown --config configs/llm_judge.yaml --output-dir outputs/llm_judge/full \
-    --datasets sick-all sick-test \
-    --baseline outputs/text_only --baseline-models jina-v5-omni-small
+qsub -g <group> -l <cpu resource>=1 -v STS_PYTHON="$(command -v python)" tsubame/job_breakdown.sh
 ```
 
-Tables go to `outputs/llm_judge/full/breakdown/`.
+Defaults: judge run `outputs/llm_judge/full`, baseline `outputs/text_only`
+with `jina-v5-omni-small`, datasets `sick-all sick-test cxc-val cxc-test`. If
+the embedding run wrote elsewhere (a group-storage `STS_OUTPUT_DIR`), pass
+`STS_BASELINE_OUTPUT_DIR` in `-v`. The job stops if either predictions
+directory is missing. Tables go to `outputs/llm_judge/full/breakdown/`; run
+`bash tsubame/job_breakdown.sh --help` for every variable.
 
 ## Run (embedding)
 

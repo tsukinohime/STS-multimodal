@@ -284,23 +284,28 @@ The judgment cache reuses the embedding cache machinery (`.cache/judgments/`),
 keyed by ordered pair text and the prompt hash, so a killed job resumes and a
 prompt edit never reuses stale answers.
 
-### SICK by NLI label
+### Breakdown by category
 
 `breakdown` splits SICK results by the pair's entailment label
-(`ENTAILMENT` / `NEUTRAL` / `CONTRADICTION`). It reads the prediction CSVs
-already on disk and loads no model, so it reproduces the original run's
-numbers exactly. Any other experiment's output directory can be added as a
-baseline, which puts the judge and an encoder side by side on the same pairs:
+(`ENTAILMENT` / `NEUTRAL` / `CONTRADICTION`), and any other dataset's results by
+its domain: CxC by `sampling_method` (`c2c_cocaption` / `c2c_isim`). STS3k has no
+categories and is skipped. It reads the prediction CSVs already on disk and
+loads no model, so it reproduces the original run's numbers exactly. Any other
+experiment's output directory can be added as a baseline, which puts the judge
+and an encoder side by side on the same pairs:
 
 ```bash
-python -m sts.cli breakdown --config configs/llm_judge.yaml --datasets sick-all sick-test \
+python -m sts.cli breakdown --config configs/llm_judge.yaml \
+    --datasets sick-all sick-test cxc-val cxc-test \
     --baseline outputs/text_only --baseline-models jina-v5-omni-small
 ```
+
+On TSUBAME, `tsubame/job_breakdown.sh` runs exactly this as a CPU job.
 
 Per system and label: Spearman/Pearson within the label, the pooled Spearman
 with that label left out, the mean rank offset rank(pred) − rank(gold) (where a
 label sits relative to the annotators), the label's share of the squared rank
-error, and, for a judge, its mean score next to the gold mean on the same 1–5
+error, and, for a judge, its mean score next to the gold mean on the dataset's own
 scale. Also per system: the pooled Spearman with each label's mean offset
 removed. This is a diagnostic that uses the labels, and its gain over the plain value is
 the correlation lost to whole labels sitting at the wrong height. Written to
@@ -431,7 +436,7 @@ sts/
   manifest.py      reproducibility record
   report.py        metrics CSV/JSON + markdown summary
   diagnostics.py   validation checks + cross-model alignment probe
-  breakdown.py     SICK results split by NLI label, from predictions on disk
+  breakdown.py     results by SICK NLI label / CxC sampling_method, from predictions on disk
   cli.py           command-line entry point
   judge/           LLM-as-judge: prompts.py (specs + hashes), scorer.py
                    (next-token expectation), pipeline.py (orchestration)
@@ -444,5 +449,5 @@ scripts/
   smoke_test.py    run twice + validate everything
 tsubame/
   README.md  env.sh.example  activate_env.sh  prefetch_models.sh
-  job_sts.sh  submit.sh
+  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh
 ```

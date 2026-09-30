@@ -1,10 +1,11 @@
-"""Post-hoc SICK breakdown by NLI label.
+"""Post-hoc breakdown by pair category: SICK's NLI label, or any other dataset's domain.
 
 Reads prediction CSVs already on disk — judge or embedding, any mix — and
-joins SICK's entailment annotation to each pair by ``pair_id``. Nothing is
-re-scored: the per-pair predictions are the experiment, and grouping them by a
-label the adapter leaves out is bookkeeping, so the numbers are exactly those
-of the original run.
+gives each pair a label: for SICK, its entailment annotation, joined by
+``pair_id``; for everything else, the pair table's ``domain`` (CxC's
+``sampling_method``: ``c2c_cocaption`` / ``c2c_isim``). Nothing is re-scored:
+the per-pair predictions are the experiment, and grouping them is bookkeeping,
+so the numbers are exactly those of the original run.
 
 Per system and label it reports:
 
@@ -22,7 +23,8 @@ Per system and label it reports:
   Σ(rank(pred) − rank(gold))², the quantity Spearman's ρ is one minus (up to
   the tie correction). Set it against the label's share of pairs.
 * ``pred_mean`` next to ``gold_mean`` in native units — directly comparable for
-  a judge answering on SICK's own 1–5 scale, not for cosine.
+  a judge answering on the dataset's own scale (SICK 1–5, CxC 0–5), not for
+  cosine.
 
 Per system it also reports ``spearman_offset_removed``: the pooled Spearman
 after subtracting each label's mean rank offset. It uses the gold labels, so it
@@ -103,11 +105,21 @@ def find_systems(
 
 def aligned_frame(
     config: ExperimentConfig, dataset_name: str, systems: Sequence[System], label_column: str
-) -> Dict[str, object]:
-    """One row per pair every system scored: label, gold, sentences, one column per system."""
+) -> Optional[Dict[str, object]]:
+    """One row per pair every system scored: label, gold, sentences, one column per system.
+
+    ``None`` when the dataset has fewer than two categories (STS3k has none).
+    """
     dataset = load_dataset(dataset_name, config.data)
     pairs = dataset.to_dataframe().set_index("pair_id")
-    labels = load_sick_labels(config.data.sick_path, dataset.split, label_column)
+    if dataset.name.startswith("sick-"):
+        labels = load_sick_labels(config.data.sick_path, dataset.split, label_column)
+    else:
+        label_column = str(dataset.notes.get("domain_column") or "domain")
+        labels = pairs["domain"].replace("", np.nan)
+    if labels.nunique() < 2:
+        _log.warning("%s: fewer than two %s values, nothing to break down", dataset_name, label_column)
+        return None
 
     frame = pairs[["gold_score", "sentence1", "sentence2"]].join(labels.rename("label"), how="left")
     if frame["label"].isna().any():
@@ -130,7 +142,8 @@ def aligned_frame(
     if not keep.all():
         _log.warning("%s: scoring %d of %d pairs, the ones every system predicted",
                      dataset_name, int(keep.sum()), len(frame))
-    return {"frame": frame[keep].copy(), "n_dataset": len(frame), "missing": dropped}
+    return {"frame": frame[keep].copy(), "n_dataset": len(frame), "missing": dropped,
+            "label_column": label_column}
 
 
 # --------------------------------------------------------------------------- #
@@ -269,8 +282,8 @@ def build_markdown(
         ],
     )
     lines += [
-        "Within-label values are low for every system because each label spans a narrow slice "
-        "of the gold scale. Compare systems within a row.",
+        "A label spanning a narrow slice of the gold scale (small sd) gives low within-label "
+        "values for every system. Compare systems within a row.",
         "",
         "## Pooled Spearman with one label removed",
         "",
@@ -313,7 +326,7 @@ def build_markdown(
     )
     judges = [s.key for s in systems if s.column == "expected_score"]
     if judges:
-        lines += ["## Judge score vs gold, same 1–5 scale", ""]
+        lines += ["## Judge score vs gold, on the dataset's own scale", ""]
         lines += _table(
             ["label", "gold mean"] + judges,
             [[label, _fmt(first.loc[label, "gold_mean"], 2)]
@@ -341,13 +354,15 @@ def run_breakdown(
             _log.error("%s: no predictions found, skipped", name)
             continue
         aligned = aligned_frame(config, name, systems, label_column)
+        if aligned is None:
+            continue
         frame = aligned["frame"]
         rows = breakdown_rows(frame, systems)
         markdown = build_markdown(
-            name, label_column, systems, rows, len(frame), aligned["n_dataset"], aligned["missing"]
+            name, aligned["label_column"], systems, rows, len(frame), aligned["n_dataset"], aligned["missing"]
         )
 
-        stem = directory / f"{name}__{label_column}"
+        stem = directory / f"{name}__{aligned['label_column']}"
         paths = [stem.with_suffix(".csv"), stem.with_suffix(".md"), stem.with_name(stem.name + "__worst.csv")]
         rows.to_csv(paths[0], index=False)
         paths[1].write_text(markdown, encoding="utf-8")
