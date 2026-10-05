@@ -3,10 +3,15 @@
 # Download model weights into the shared HF cache. Run this ON THE LOGIN NODE.
 #
 #   bash tsubame/prefetch_models.sh
+#   STS_CONFIG=configs/d1_image_only.yaml bash tsubame/prefetch_models.sh   # + FLUX.2 [klein]
 #
 # Compute nodes normally have no route to the internet, so the weights have to
 # be on a shared filesystem before any job starts. This is the one step that
 # belongs on a login node: it is pure I/O, no GPU and no computation.
+#
+# Selected from $STS_CONFIG: the encoders (STS_MODELS, or the enabled ones), the
+# enabled judges and the image generator. Ids that are local directories (a
+# judge copied to group storage, say) are skipped.
 #
 # Re-running is cheap — the hub client skips files it already has.
 # -----------------------------------------------------------------------------
@@ -27,6 +32,7 @@ cd "$STS_REPO"
 echo
 echo "[prefetch] reading model ids from $STS_CONFIG"
 python - "$STS_CONFIG" "${STS_MODELS:-}" <<'PYTHON'
+import os
 import sys
 from pathlib import Path
 
@@ -36,13 +42,25 @@ from sts.config import load_config
 
 config_path, wanted = sys.argv[1], sys.argv[2].split()
 config = load_config(config_path)
-specs = [m for m in config.models if (m.key in wanted if wanted else m.enabled)]
+specs = [(m.key, m.model_id, "hub") for m in config.models if (m.key in wanted if wanted else m.enabled)]
+specs += [(j.key, j.model_id, "hub") for j in config.judges if j.enabled]
+generator = config.images.generator
+if generator is not None and generator.backend == "flux2-klein":
+    specs.append((generator.key, generator.model_id, "diffusers"))
+specs = [s for s in specs if not os.path.isdir(s[1]) and not s[1].startswith("/")]
 if not specs:
-    raise SystemExit(f"no models selected from {config_path} (STS_MODELS={wanted})")
+    raise SystemExit(f"no Hub models selected from {config_path} (STS_MODELS={wanted})")
 
-for spec in specs:
-    print(f"\n[prefetch] {spec.key}  ->  {spec.model_id}", flush=True)
-    path = snapshot_download(spec.model_id)
+for key, model_id, kind in specs:
+    print(f"\n[prefetch] {key}  ->  {model_id}", flush=True)
+    if kind == "diffusers":
+        # The pipeline's component folders only, not the repo's extra
+        # single-file checkpoint (another 7 GB for FLUX.2-klein-4B).
+        from diffusers import DiffusionPipeline
+
+        path = DiffusionPipeline.download(model_id)
+    else:
+        path = snapshot_download(model_id)
     total = sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
     print(f"[prefetch] cached at {path} ({total / 1024**3:.2f} GiB)", flush=True)
 PYTHON
@@ -50,6 +68,7 @@ PYTHON
 echo
 echo "[prefetch] verifying the cache resolves with HF_HUB_OFFLINE=1"
 HF_HUB_OFFLINE=1 python - "$STS_CONFIG" "${STS_MODELS:-}" <<'PYTHON'
+import os
 import sys
 from pathlib import Path
 
@@ -60,15 +79,25 @@ from sts.manifest import resolve_model_revision
 
 config_path, wanted = sys.argv[1], sys.argv[2].split()
 config = load_config(config_path)
-specs = [m for m in config.models if (m.key in wanted if wanted else m.enabled)]
+specs = [(m.key, m.model_id, "hub") for m in config.models if (m.key in wanted if wanted else m.enabled)]
+specs += [(j.key, j.model_id, "hub") for j in config.judges if j.enabled]
+generator = config.images.generator
+if generator is not None and generator.backend == "flux2-klein":
+    specs.append((generator.key, generator.model_id, "diffusers"))
+specs = [s for s in specs if not os.path.isdir(s[1]) and not s[1].startswith("/")]
 ok = True
-for spec in specs:
+for key, model_id, kind in specs:
     try:
-        snapshot_download(spec.model_id, local_files_only=True)
-        print(f"  OK   {spec.key:<24} revision {resolve_model_revision(spec.model_id)}")
+        if kind == "diffusers":
+            from diffusers import DiffusionPipeline
+
+            DiffusionPipeline.download(model_id, local_files_only=True)
+        else:
+            snapshot_download(model_id, local_files_only=True)
+        print(f"  OK   {key:<24} revision {resolve_model_revision(model_id)}")
     except Exception as exc:
         ok = False
-        print(f"  FAIL {spec.key:<24} {type(exc).__name__}: {exc}")
+        print(f"  FAIL {key:<24} {type(exc).__name__}: {exc}")
 raise SystemExit(0 if ok else 1)
 PYTHON
 

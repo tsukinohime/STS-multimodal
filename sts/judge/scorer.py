@@ -58,6 +58,15 @@ class ScoreBatch:
         return out
 
 
+def model_load_kwargs(spec: JudgeSpec, device: str, dtype: str) -> dict:
+    kwargs = {"dtype": torch_dtype(dtype), "trust_remote_code": spec.trust_remote_code}
+    if device == "cuda":
+        # Stream straight onto the GPU; a ~70 GB checkpoint must not be
+        # staged through host RAM twice.
+        kwargs["device_map"] = "cuda"
+    return kwargs
+
+
 class LLMJudge:
     """A frozen chat LLM used as a pairwise similarity rater."""
 
@@ -70,7 +79,6 @@ class LLMJudge:
         progress: bool = True,
     ) -> None:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.key = spec.key
         self.model_id = spec.model_id
@@ -83,25 +91,13 @@ class LLMJudge:
         self._torch = torch
 
         _log.info("Loading judge %s on %s / %s", spec.model_id, device, dtype)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            spec.model_id, trust_remote_code=spec.trust_remote_code
-        )
+        self.tokenizer, self.model, template = self._load(spec, device, dtype)
         # Left padding: the answer slot must be the last position of every row.
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        load_kwargs = {"dtype": torch_dtype(dtype), "trust_remote_code": spec.trust_remote_code}
-        if device == "cuda":
-            # Stream straight onto the GPU; a ~70 GB checkpoint must not be
-            # staged through host RAM twice.
-            load_kwargs["device_map"] = "cuda"
-        self.model = AutoModelForCausalLM.from_pretrained(spec.model_id, **load_kwargs)
-        if device != "cuda":
-            self.model = self.model.to(device)
         self.model.eval()
 
-        template = self.tokenizer.chat_template or ""
         self.template_hash = sha256_text(template)
         self.template_supports_thinking = "enable_thinking" in template
         if self.template_supports_thinking:
@@ -112,6 +108,16 @@ class LLMJudge:
         space_ids = self.tokenizer.encode(" ", add_special_tokens=False)
         self._space_id: Optional[int] = space_ids[0] if len(space_ids) == 1 else None
         self._digit_cache: dict = {}
+
+    def _load(self, spec: JudgeSpec, device: str, dtype: str):
+        """``(tokenizer, model, chat_template)``; :class:`~sts.judge.vlm.VLMJudge` overrides it."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(spec.model_id, trust_remote_code=spec.trust_remote_code)
+        model = AutoModelForCausalLM.from_pretrained(spec.model_id, **model_load_kwargs(spec, device, dtype))
+        if device != "cuda":
+            model = model.to(device)
+        return tokenizer, model, tokenizer.chat_template or ""
 
     # -- prompt plumbing ---------------------------------------------------
     def digit_token_ids(self, scale: Sequence[int]) -> List[int]:
@@ -146,6 +152,44 @@ class LLMJudge:
         return sha256_text(f"{spec.spec_hash}|{self.template_hash}|thinking={self.enable_thinking}")
 
     # -- scoring -----------------------------------------------------------
+    def _batches(self, prompts: Sequence) -> List[Sequence]:
+        return [prompts[i : i + self.batch_size] for i in range(0, len(prompts), self.batch_size)]
+
+    def _with_progress(self, iterable, total: int):
+        if self.progress:
+            try:
+                from tqdm import tqdm
+
+                return tqdm(iterable, total=total, desc=f"judge[{self.key}]", unit="batch", leave=False)
+            except ImportError:
+                pass
+        return iterable
+
+    def _check_lengths(self, lengths) -> None:
+        too_long = int((lengths > self.max_prompt_tokens).sum())
+        if too_long:
+            _log.warning("%d prompt(s) exceed max_prompt_tokens=%d (not truncated)",
+                         too_long, self.max_prompt_tokens)
+
+    def _read_answer(self, logits, ids: List[int]):
+        """``(p(digit) per allowed digit, p(" "))`` at the answer position, per row."""
+        torch = self._torch
+        logprobs = torch.log_softmax(logits.float(), dim=-1)
+        probs = logprobs[:, ids].exp().cpu().numpy()
+        if self._space_id is not None:
+            space = logprobs[:, self._space_id].exp().cpu().numpy()
+        else:
+            space = np.zeros(logits.shape[0], dtype=np.float32)
+        return probs, space
+
+    @staticmethod
+    def _collect(probs_out, space_out, len_out) -> ScoreBatch:
+        return ScoreBatch(
+            raw_probs=np.concatenate(probs_out, axis=0).astype(np.float64),
+            space_mass=np.concatenate(space_out, axis=0).astype(np.float64),
+            prompt_tokens=np.concatenate(len_out, axis=0).astype(np.int32),
+        )
+
     def score(self, prompts: Sequence[str], scale: Sequence[int]) -> ScoreBatch:
         torch = self._torch
         prompts = list(prompts)
@@ -154,47 +198,28 @@ class LLMJudge:
         space_out: List[np.ndarray] = []
         len_out: List[np.ndarray] = []
 
-        batches = [prompts[i : i + self.batch_size] for i in range(0, len(prompts), self.batch_size)]
-        iterator = batches
-        if self.progress:
-            try:
-                from tqdm import tqdm
-
-                iterator = tqdm(batches, desc=f"judge[{self.key}]", unit="batch", leave=False)
-            except ImportError:
-                pass
-
+        batches = self._batches(prompts)
         with torch.inference_mode():
-            for batch in iterator:
+            for batch in self._with_progress(batches, len(batches)):
                 # The template already contains every special token, so the
                 # tokenizer must not add another BOS.
                 encoded = self.tokenizer(
                     batch, return_tensors="pt", padding=True, add_special_tokens=False
                 ).to(self.device)
                 lengths = encoded["attention_mask"].sum(dim=1)
-                too_long = int((lengths > self.max_prompt_tokens).sum())
-                if too_long:
-                    _log.warning("%d prompt(s) exceed max_prompt_tokens=%d (not truncated)",
-                                 too_long, self.max_prompt_tokens)
+                self._check_lengths(lengths)
                 try:
                     # Only the last position is needed; materialising logits
                     # for every position over a 250k vocab would cost GBs.
                     logits = self.model(**encoded, logits_to_keep=1).logits[:, -1, :]
                 except TypeError:
                     logits = self.model(**encoded).logits[:, -1, :]
-                logprobs = torch.log_softmax(logits.float(), dim=-1)
-                probs_out.append(logprobs[:, ids].exp().cpu().numpy())
-                if self._space_id is not None:
-                    space_out.append(logprobs[:, self._space_id].exp().cpu().numpy())
-                else:
-                    space_out.append(np.zeros(len(batch), dtype=np.float32))
+                probs, space = self._read_answer(logits, ids)
+                probs_out.append(probs)
+                space_out.append(space)
                 len_out.append(lengths.cpu().numpy())
 
-        return ScoreBatch(
-            raw_probs=np.concatenate(probs_out, axis=0).astype(np.float64),
-            space_mass=np.concatenate(space_out, axis=0).astype(np.float64),
-            prompt_tokens=np.concatenate(len_out, axis=0).astype(np.int32),
-        )
+        return self._collect(probs_out, space_out, len_out)
 
     def describe(self) -> dict:
         return {

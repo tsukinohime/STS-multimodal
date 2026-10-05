@@ -125,6 +125,22 @@ class RuntimeConfig:
         self.cache_dir = Path(self.cache_dir)
 
 
+#: What a model or judge is shown for each sentence: the sentence itself, or
+#: the image the configured generator made from it (condition D1).
+INPUT_KINDS = ("text", "image")
+
+
+def _input_fingerprint(input_kind: str, image_size: Optional[int]) -> Dict[str, Any]:
+    """Extra fingerprint keys for image input.
+
+    Empty for text input on purpose: adding keys would change the hash of every
+    existing text cache and silently force a full recompute.
+    """
+    if input_kind == "text":
+        return {}
+    return {"input": input_kind, "image_size": image_size}
+
+
 @dataclass
 class ModelSpec:
     """One frozen encoder. ``key`` names it in every output table."""
@@ -142,6 +158,8 @@ class ModelSpec:
     max_length: Optional[int] = None
     dtype: Optional[str] = None
     trust_remote_code: bool = True
+    input: str = "text"               # text | image (the generated image of each sentence)
+    image_size: Optional[int] = None  # image input: longer side in pixels; None = as generated
     enabled: bool = True
     notes: str = ""
 
@@ -162,6 +180,7 @@ class ModelSpec:
             "pooling": self.pooling,
             "max_length": self.max_length,
             "dtype": self.dtype,
+            **_input_fingerprint(self.input, self.image_size),
         }
 
 
@@ -186,6 +205,8 @@ class JudgeSpec:
     max_prompt_tokens: int = 1024       # flagged, never truncated
     dtype: Optional[str] = None
     trust_remote_code: bool = False
+    input: str = "text"                 # text | image: the judge sees the generated images instead
+    image_size: Optional[int] = None    # image input: longer side in pixels; None = as generated
     enabled: bool = True
     notes: str = ""
 
@@ -197,7 +218,69 @@ class JudgeSpec:
             "prompt_set": self.prompt_set,
             "enable_thinking": self.enable_thinking,
             "dtype": self.dtype,
+            **_input_fingerprint(self.input, self.image_size),
         }
+
+
+@dataclass
+class GeneratorSpec:
+    """The text-to-image model that turns every sentence into one image.
+
+    Every setting that can change a pixel is in :meth:`fingerprint`, which
+    names the image-store directory: changing one writes a new store instead of
+    mixing two generators' images. ``dtype`` is used exactly as written (never
+    resolved from the device), because the jobs that *read* the store run on
+    other devices and must arrive at the same directory.
+    """
+
+    key: str = "flux2-klein-4b"
+    model_id: str = "black-forest-labs/FLUX.2-klein-4B"
+    backend: str = "flux2-klein"        # flux2-klein | render-text (laptop stand-in, no model)
+    height: int = 1024
+    width: int = 1024
+    num_inference_steps: int = 4        # klein is step-distilled to 4 steps
+    guidance_scale: float = 1.0         # the distilled checkpoint ignores guidance; recorded anyway
+    max_sequence_length: int = 512      # prompt tokens; longer prompts are counted and reported
+    seed: int = 0
+    seed_policy: str = "shared"         # shared: one seed for every sentence | per-text: hash of the text
+    dtype: str = "bfloat16"
+    batch_size: int = 8                 # prompts per pipeline call
+    image_format: str = "jpeg"          # jpeg | png
+    jpeg_quality: int = 95
+    notes: str = ""
+
+    def fingerprint(self) -> Dict[str, Any]:
+        fingerprint = {
+            "model_id": self.model_id,
+            "backend": self.backend,
+            "height": self.height,
+            "width": self.width,
+            "num_inference_steps": self.num_inference_steps,
+            "guidance_scale": self.guidance_scale,
+            "max_sequence_length": self.max_sequence_length,
+            "seed": self.seed,
+            "seed_policy": self.seed_policy,
+            "dtype": self.dtype,
+            "image_format": self.image_format,
+        }
+        if self.image_format == "jpeg":
+            fingerprint["jpeg_quality"] = self.jpeg_quality
+        return fingerprint
+
+
+@dataclass
+class ImagesConfig:
+    """Where generated images live and how they are produced (conditions D*, E*)."""
+
+    store_dir: Path = REPO_ROOT / ".cache" / "images"
+    #: Images per tar shard: the resume granularity and the file-count lever.
+    flush_every: int = 512
+    #: Pairs per dataset rendered side by side into <output_dir>/images_preview/.
+    preview_pairs: int = 4
+    generator: Optional[GeneratorSpec] = None
+
+    def __post_init__(self) -> None:
+        self.store_dir = Path(self.store_dir)
 
 
 @dataclass
@@ -225,6 +308,10 @@ class ExperimentConfig:
     data: DataPaths = field(default_factory=DataPaths)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
+    images: ImagesConfig = field(default_factory=ImagesConfig)
+    #: Experimental condition this config implements (e.g. "D1"); selects the
+    #: method paragraph of the summary. Empty for the text-only baselines.
+    condition: str = ""
     #: Absolute path of the YAML this was loaded from (recorded in the manifest).
     source_path: Optional[Path] = None
     #: Suffix for manifest/metrics/summary filenames. One TSUBAME job per model
@@ -243,6 +330,11 @@ class ExperimentConfig:
     @property
     def enabled_judges(self) -> List[JudgeSpec]:
         return [j for j in self.judges if j.enabled]
+
+    @property
+    def uses_images(self) -> bool:
+        """True when an enabled model or judge reads generated images."""
+        return any(s.input == "image" for s in [*self.enabled_models, *self.enabled_judges])
 
     def judge_by_key(self, key: str) -> JudgeSpec:
         for judge in self.judges:
@@ -289,6 +381,7 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
     metrics_raw = raw.get("metrics", {}) or {}
     models_raw = raw.get("models", []) or []
     judges_raw = raw.get("judges", []) or []
+    images_raw = dict(raw.get("images", {}) or {})
 
     data = DataPaths(
         root=_expand(data_raw.get("root", REPO_ROOT / "data" / "raw"), base),
@@ -330,6 +423,26 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
     clash = {m.key for m in models} & {j.key for j in judges}
     if clash:
         raise ValueError(f"{path}: keys used by both a model and a judge: {sorted(clash)}")
+    for spec in [*models, *judges]:
+        if spec.input not in INPUT_KINDS:
+            raise ValueError(f"{spec.key!r}: input must be one of {INPUT_KINDS}, got {spec.input!r}")
+
+    generator_raw = images_raw.pop("generator", None)
+    generator = None
+    if generator_raw:
+        unknown = set(generator_raw) - set(GeneratorSpec.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"images.generator: unknown keys {sorted(unknown)}")
+        generator = GeneratorSpec(**generator_raw)
+    unknown = set(images_raw) - set(ImagesConfig.__dataclass_fields__)
+    if unknown:
+        raise ValueError(f"images: unknown keys {sorted(unknown)}")
+    if "store_dir" in images_raw:
+        images_raw["store_dir"] = _expand(images_raw["store_dir"], base)
+    images = ImagesConfig(**images_raw, generator=generator)
+    needs_images = [s.key for s in [*models, *judges] if s.input == "image"]
+    if needs_images and generator is None:
+        raise ValueError(f"{path}: {needs_images} read generated images, but images.generator is not set")
 
     config = ExperimentConfig(
         name=experiment.get("name", "text_only_baseline"),
@@ -342,6 +455,8 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
         data=data,
         runtime=runtime,
         metrics=metrics,
+        images=images,
+        condition=str(experiment.get("condition", "") or ""),
         source_path=path,
     )
 
@@ -357,6 +472,8 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
             config.metrics = replace(config.metrics, bootstrap=int(value))
         elif field_name == "output_dir":
             config.output_dir = Path(value)
+        elif field_name == "image_dir":
+            config.images = replace(config.images, store_dir=Path(value))
         elif field_name == "run_tag":
             config.run_tag = str(value)
         elif field_name == "data_root":

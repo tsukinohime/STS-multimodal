@@ -8,6 +8,11 @@ combination interrupted mid-encode restarts near where it stopped.
 
 Models are loaded one at a time and released before the next, so a run over
 several encoders never holds two sets of weights on the GPU at once.
+
+A model with ``input: image`` embeds the image the config's generator made from
+each sentence instead of the sentence (condition D1). Everything else is the
+same code path; the image store's hash joins the cache fingerprint, so image
+embeddings never mix with text embeddings or with another generator's images.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import pandas as pd
 from .cache import EmbeddingCache
 from .config import ExperimentConfig, ModelSpec, get_logger, resolve_device, resolve_dtype
 from .data import STSDataset, load_dataset
+from .images.store import ImageStore, open_image_store
 from .manifest import Manifest
 from .metrics import compute_correlations
 from .models.base import TextEncoder, build_encoder
@@ -248,13 +254,21 @@ def run_experiment(config: ExperimentConfig) -> pd.DataFrame:
         if not pair_path.exists() or not config.resume:
             dataset.to_dataframe().to_csv(pair_path, index=False)
 
+    store: Optional[ImageStore] = None
+    if any(m.input == "image" for m in config.enabled_models):
+        store = open_image_store(config)
+        _log.info("Image input from %s (%d images)", store.directory, len(store))
+
     all_metrics: List[Dict[str, object]] = []
     for model_spec in config.enabled_models:
         encoder: Optional[TextEncoder] = None
+        fingerprint = {**model_spec.fingerprint(), "resolved_dtype": dtype}
+        if model_spec.input == "image":
+            fingerprint["images"] = store.fingerprint_hash
         cache = EmbeddingCache(
             cache_dir=config.runtime.cache_dir,
             model_key=model_spec.key,
-            fingerprint={**model_spec.fingerprint(), "resolved_dtype": dtype},
+            fingerprint=fingerprint,
             enabled=config.runtime.use_cache,
         )
         try:
@@ -264,8 +278,11 @@ def run_experiment(config: ExperimentConfig) -> pd.DataFrame:
                     _log.info("[%s | %s] resume: reusing %s", model_spec.key, name, output_path)
                     predictions = pd.read_csv(output_path)
                 else:
+                    if model_spec.input == "image":
+                        # Fail before loading any weights, with the command that fixes it.
+                        store.require(dataset.unique_texts(), purpose=f"{model_spec.key} on {name}")
                     if encoder is None:
-                        encoder = build_encoder(model_spec, config.runtime)
+                        encoder = build_encoder(model_spec, config.runtime, images=store)
                         manifest.record_model(model_spec.key, model_spec.model_id, encoder.describe())
                     _log.info("[%s | %s] %d pairs, %d unique texts",
                               model_spec.key, name, len(dataset), len(dataset.unique_texts()))
@@ -296,5 +313,7 @@ def run_experiment(config: ExperimentConfig) -> pd.DataFrame:
             if encoder is not None:
                 encoder.close()
 
+    if store is not None:
+        store.close()
     manifest.finish()
     return pd.DataFrame(all_metrics)

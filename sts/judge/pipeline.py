@@ -16,6 +16,12 @@ Per (judge, dataset) the run records, beyond the correlations:
   as degenerate, and excluded from the correlation;
 * an order-symmetry diagnostic on a sample: the same pairs scored with the two
   sentences swapped, reported as mean |Δ| and the Spearman between orders.
+
+A judge with ``input: image`` (condition D1) is a :class:`~sts.judge.vlm.VLMJudge`
+shown the two images generated from the sentences, with an image prompt set.
+The cache key stays the ordered sentence pair — each sentence names its image —
+and the image store's hash joins the cache fingerprint. The order-symmetry
+check then swaps the two images.
 """
 
 from __future__ import annotations
@@ -31,10 +37,11 @@ import pandas as pd
 from ..cache import EmbeddingCache
 from ..config import ExperimentConfig, JudgeSpec, get_logger, resolve_device, resolve_dtype
 from ..data import STSDataset, load_dataset
+from ..images.store import ImageStore, open_image_store
 from ..manifest import Manifest
 from ..metrics import compute_correlations
 from ..pipeline import RunPaths, metric_rows, set_global_seed
-from .prompts import PromptSpec, family_of, get_prompt
+from .prompts import PromptSpec, family_of, get_prompt, input_of
 from .scorer import LLMJudge, ScoreBatch
 
 _log = get_logger()
@@ -47,6 +54,24 @@ _PAIR_SEPARATOR = "\x1f"
 
 def _pair_keys(sentence_a: Sequence[str], sentence_b: Sequence[str]) -> List[str]:
     return [f"{a}{_PAIR_SEPARATOR}{b}" for a, b in zip(sentence_a, sentence_b)]
+
+
+def build_judge(
+    spec: JudgeSpec,
+    device: str,
+    dtype: str,
+    batch_size: int,
+    progress: bool,
+    store: Optional[ImageStore] = None,
+) -> LLMJudge:
+    """A text judge, or for ``input: image`` a vision-language judge reading ``store``."""
+    if spec.input != "image":
+        return LLMJudge(spec, device, dtype, batch_size, progress)
+    if store is None:
+        raise ValueError(f"{spec.key}: input: image needs the image store of the config's generator")
+    from .vlm import VLMJudge
+
+    return VLMJudge(spec, device, dtype, batch_size, store, progress)
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +138,7 @@ def build_predictions(
     prompt_hash: str,
     forward: ScoreBatch,
     reverse: Optional[ScoreBatch],
+    store: Optional[ImageStore] = None,
 ) -> pd.DataFrame:
     frame = dataset.to_dataframe()
     scale = spec.scale
@@ -158,6 +184,14 @@ def build_predictions(
     if expected_rev is not None:
         columns["expected_score_fwd"] = expected_fwd
         columns["expected_score_rev"] = expected_rev
+    if judge_spec.input == "image" and store is not None:
+        # The pair was judged from these images; prompt_tokens include their image tokens.
+        columns.update({
+            "input": "image",
+            "image_size": judge_spec.image_size if judge_spec.image_size else "native",
+            "image_store": store.fingerprint_hash,
+            "generator": store.generator_key,
+        })
     return pd.DataFrame(columns)
 
 
@@ -251,6 +285,12 @@ def dump_prompt(
         return path
     pair = example.pairs[0]
     rendered = judge.render(spec, pair.sentence1, pair.sentence2)
+    images = getattr(rendered, "images", None)
+    rendered = getattr(rendered, "text", rendered)
+    image_lines = [
+        f"- input: images generated from the two sentences (store `{judge.store.directory.name}`); "
+        "the sentences themselves are not in the prompt",
+    ] if images else []
     body = "\n".join([
         f"# Prompt {spec.family} {spec.version}",
         "",
@@ -260,6 +300,7 @@ def dump_prompt(
         f"- judge: `{judge.model_id}`",
         f"- enable_thinking: {judge.enable_thinking}",
         f"- scale: {list(spec.scale)}",
+        *image_lines,
         "",
         "## Source of the anchors",
         "",
@@ -309,6 +350,11 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
         if not pair_path.exists() or not config.resume:
             dataset.to_dataframe().to_csv(pair_path, index=False)
 
+    store: Optional[ImageStore] = None
+    if any(j.input == "image" for j in config.enabled_judges):
+        store = open_image_store(config)
+        _log.info("Image input from %s (%d images)", store.directory, len(store))
+
     all_metrics: List[Dict[str, object]] = []
     for judge_spec in config.enabled_judges:
         judge: Optional[LLMJudge] = None
@@ -317,17 +363,25 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
         try:
             for name, dataset in datasets.items():
                 spec = get_prompt(judge_spec.prompt_set, name)
+                if input_of(spec) != judge_spec.input:
+                    raise ValueError(
+                        f"{judge_spec.key}: input is {judge_spec.input!r} but prompt set "
+                        f"{judge_spec.prompt_set!r} is for {input_of(spec)!r} input"
+                    )
                 output_path = paths.prediction_file(judge_spec.key, name)
 
                 if config.resume and output_path.exists():
                     _log.info("[%s | %s] resume: reusing %s", judge_spec.key, name, output_path)
                     predictions = pd.read_csv(output_path)
                 else:
+                    if judge_spec.input == "image":
+                        # Fail before loading ~70 GB of weights, with the command that fixes it.
+                        store.require(dataset.unique_texts(), purpose=f"{judge_spec.key} on {name}")
                     if judge is None:
-                        judge = LLMJudge(
+                        judge = build_judge(
                             judge_spec, device, judge_dtype,
                             judge_spec.batch_size or config.runtime.batch_size,
-                            config.runtime.progress,
+                            config.runtime.progress, store,
                         )
                         manifest.record_model(judge_spec.key, judge_spec.model_id, {
                             **judge.describe(),
@@ -338,15 +392,18 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
                     prompt_hash = judge.prompt_hash(spec)
                     family = family_of(name)
                     if family not in caches:
+                        fingerprint = {
+                            **judge_spec.fingerprint(),
+                            "resolved_dtype": judge_dtype,
+                            "prompt_hash": prompt_hash,
+                            "scale": list(spec.scale),
+                        }
+                        if judge_spec.input == "image":
+                            fingerprint["images"] = store.fingerprint_hash
                         caches[family] = EmbeddingCache(
                             cache_dir=config.runtime.cache_dir,
                             model_key=f"{judge_spec.key}__{family}",
-                            fingerprint={
-                                **judge_spec.fingerprint(),
-                                "resolved_dtype": judge_dtype,
-                                "prompt_hash": prompt_hash,
-                                "scale": list(spec.scale),
-                            },
+                            fingerprint=fingerprint,
                             enabled=config.runtime.use_cache,
                         )
                     cache = caches[family]
@@ -363,7 +420,9 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
                         reverse = score_pairs_cached(
                             judge, spec, cache, dataset.sentence2, dataset.sentence1, config.runtime.flush_every
                         )
-                    predictions = build_predictions(dataset, judge_spec, spec, prompt_hash, forward, reverse)
+                    predictions = build_predictions(
+                        dataset, judge_spec, spec, prompt_hash, forward, reverse, store
+                    )
 
                     symmetry = symmetry_check(
                         judge, spec, cache, dataset,
@@ -417,5 +476,7 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
             if judge is not None:
                 judge.close()
 
+    if store is not None:
+        store.close()
     manifest.finish()
     return pd.DataFrame(all_metrics)

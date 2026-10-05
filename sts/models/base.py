@@ -64,8 +64,23 @@ def batched(items: Sequence[str], size: int) -> List[Sequence[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def build_encoder(spec: ModelSpec, runtime: RuntimeConfig) -> TextEncoder:
-    """Instantiate the adapter named by ``spec.backend``."""
+def build_encoder(spec: ModelSpec, runtime: RuntimeConfig, images=None) -> TextEncoder:
+    """Instantiate the adapter named by ``spec.backend``.
+
+    With ``input: image`` the adapter is wrapped so that it embeds each
+    sentence's generated image from ``images`` (an :class:`~sts.images.ImageStore`).
+    """
+    if spec.input == "image" and images is None:
+        raise ValueError(f"{spec.key}: input: image needs the image store of the config's generator")
+    encoder = _build_backend(spec, runtime)
+    if spec.input != "image":
+        return encoder
+    from .images import GeneratedImageEncoder
+
+    return GeneratedImageEncoder(encoder, images, spec.image_size)
+
+
+def _build_backend(spec: ModelSpec, runtime: RuntimeConfig) -> TextEncoder:
     device = resolve_device(runtime.device)
     dtype = resolve_dtype(spec.dtype or runtime.dtype, device)
     batch_size = spec.batch_size or runtime.batch_size

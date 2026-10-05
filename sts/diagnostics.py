@@ -356,16 +356,46 @@ def run_validation(
             probe_s2.extend(subset.sentence2)
         probe_texts = list(dict.fromkeys(probe_s1 + probe_s2))[:sample]
 
+        store = None
+        if any(spec.input == "image" for spec in config.enabled_models):
+            from .images.store import open_image_store
+
+            store = open_image_store(config)
         for spec in config.enabled_models:
-            encoder = build_encoder(spec, config.runtime)
+            s1, s2, texts = probe_s1, probe_s2, probe_texts
+            if spec.input == "image":
+                # The same invariants hold for image embeddings, probed on
+                # sentences whose images exist (the run may have used --limit).
+                s1, s2 = _pairs_with_images(datasets, store, per_dataset, config)
+                texts = list(dict.fromkeys(s1 + s2))[:sample]
+                if len(s1) < 2:
+                    results.append(CheckResult(f"image_probes_available[{spec.key}]", False,
+                                               f"fewer than 2 pairs with generated images in {store.directory}"))
+                    continue
+            encoder = build_encoder(spec, config.runtime, images=store)
             try:
-                results.append(check_embedding_norms(encoder, probe_texts))
-                results.append(check_identical_sentences(encoder, probe_texts))
-                results.append(check_order_symmetry(encoder, probe_s1, probe_s2))
+                results.append(check_embedding_norms(encoder, texts))
+                results.append(check_identical_sentences(encoder, texts))
+                results.append(check_order_symmetry(encoder, s1, s2))
             finally:
                 encoder.close()
+        if store is not None:
+            store.close()
 
     return results
+
+
+def _pairs_with_images(datasets: Dict[str, STSDataset], store, per_dataset: int, config: ExperimentConfig):
+    """Up to ``per_dataset`` pairs per dataset whose two generated images are both stored."""
+    s1: List[str] = []
+    s2: List[str] = []
+    for dataset in datasets.values():
+        if config.limit:
+            dataset = dataset.subsample(config.limit, seed=config.runtime.seed)
+        kept = [p for p in dataset.pairs if p.sentence1 in store and p.sentence2 in store][:per_dataset]
+        s1.extend(p.sentence1 for p in kept)
+        s2.extend(p.sentence2 for p in kept)
+    return s1, s2
 
 
 def write_validation_report(results: List[CheckResult], path: Path, extra: Optional[dict] = None) -> Path:

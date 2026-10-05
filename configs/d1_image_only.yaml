@@ -1,0 +1,158 @@
+# =============================================================================
+# Condition D1: generated image only.
+#
+# Each sentence is given to a text-to-image model (FLUX.2 [klein] 4B) and only
+# the two generated images are compared; the scorers never see the sentences.
+# The gap to B1 (the same VLM judging the sentences, no image) and to the
+# jina-v5 text cosine measures how much of a pair's meaning survives
+# text -> image -> model.
+#
+# Three stages, each resumable and each its own GPU job on TSUBAME
+# (tsubame/job_d1.sh):
+#   python -m sts.cli imagine --config configs/d1_image_only.yaml  # 1.  sentences -> images
+#   python -m sts.cli run     --config configs/d1_image_only.yaml  # 2a. image-embedding cosine
+#   python -m sts.cli judge   --config configs/d1_image_only.yaml  # 2b. VLM judge on the two images
+#   python -m sts.cli report  --config configs/d1_image_only.yaml  # one summary for both scorers
+#
+# Datasets, splits, categories, seed, metrics, macro average and the
+# prediction schema are those of the text baselines, so
+#   python -m sts.cli breakdown --config configs/d1_image_only.yaml \
+#       --baseline outputs/text_only --baseline outputs/llm_judge/full
+# lines D1 up against them pair by pair.
+# =============================================================================
+
+experiment:
+  name: d1_image_only
+  condition: D1
+  output_dir: outputs/d1_image_only
+  seed: 42
+  resume: true
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: auto
+  dtype: auto               # bfloat16 on cuda
+  batch_size: 16
+  max_length: 512           # text-encoder setting; unused for image input
+  # Image-embedding and image-judgment caches. Their fingerprints carry the
+  # image-store hash, so they never mix with the text caches or with another
+  # generator's images.
+  cache_dir: .cache/d1
+  use_cache: true
+  flush_every: 512          # pairs (judge) / sentences (encoder) between cache flushes
+  progress: true
+  seed: 42
+
+# -----------------------------------------------------------------------------
+# Image generation. ~60k unique sentences over these datasets (CxC 49.5k,
+# SICK 6.1k, STS3k 4.4k) -> one image each, generated once and reused by every
+# image condition (D1, D2, E2, ...).
+#
+# The store directory is named by a hash of every setting below, so changing
+# any of them (size, steps, seed policy, format, ...) starts a new store
+# instead of silently mixing images.
+# -----------------------------------------------------------------------------
+images:
+  store_dir: .cache/images    # put this on group storage on TSUBAME (or pass --image-dir)
+  flush_every: 512            # images per tar shard: ~120 files for the full run, not ~60k
+  preview_pairs: 4            # pairs per dataset drawn side by side in <output_dir>/images_preview/
+  generator:
+    key: flux2-klein-4b
+    # A local directory works too (e.g. a copy on group storage).
+    model_id: black-forest-labs/FLUX.2-klein-4B
+    backend: flux2-klein
+    height: 1024              # the resolution klein is tuned and tested at
+    width: 1024
+    num_inference_steps: 4    # step-distilled checkpoint: 4 steps
+    guidance_scale: 1.0       # ignored by the distilled checkpoint; recorded anyway
+    max_sequence_length: 512
+    seed: 0
+    # shared: every sentence starts from the same noise, so two images differ
+    # only through what the two texts change. per-text: an independent seed
+    # derived from each sentence.
+    seed_policy: shared
+    dtype: bfloat16           # weights ~15 GB (transformer 7.2 + Qwen3-4B text encoder 7.5 + VAE)
+    batch_size: 8             # prompts per pipeline call; lower it on OOM
+    # jpeg q95 with 4:4:4 chroma: ~0.5 MB per 1024 px image vs ~1.6 MB for
+    # lossless png (measured on one FLUX sample photo), i.e. ~30 GB vs ~95 GB
+    # for the full run. The scorers resize every image anyway.
+    image_format: jpeg
+    jpeg_quality: 95
+
+# -----------------------------------------------------------------------------
+# D1 scorer 1: image-embedding cosine.
+#
+# jina-embeddings-v5-omni-small with modality: vision (vision + text towers).
+# Each generated image is embedded through the checkpoint's own processor and
+# embed() with the text-matching adapter and the "Document: " prompt, the path
+# the model card gives for non-retrieval tasks. Same model and space as the
+# text baseline's main model, so the two cosines are directly comparable.
+# image_size: null feeds the image as generated (1024 px -> 1024 image tokens,
+# within the checkpoint's 256-1280 token range).
+# -----------------------------------------------------------------------------
+models:
+  - key: d1-jina-v5-omni-small
+    model_id: jinaai/jina-embeddings-v5-omni-small
+    backend: jina-v5
+    task: text-matching
+    prompt_name: document
+    modality: vision
+    input: image
+    image_size: null
+    truncate_dim: null
+    batch_size: 32
+    enabled: true
+    notes: "D1 control: cosine between the two generated images' embeddings."
+
+# -----------------------------------------------------------------------------
+# D1 scorer 2: the LLM judge as a VLM.
+#
+# Same checkpoint as the text judge (B0/B1), loaded with its vision encoder
+# (AutoModelForImageTextToText -> Qwen3_5MoeForConditionalGeneration). Prompt
+# set image-v1 = the v1 prompts verbatim, with the sentence pair replaced by
+# the two images; thinking off; digit expectation from one forward pass.
+#
+# image_size: 512 resizes each image to 512 px (256 image tokens), so a pair is
+# 736-846 prompt tokens (measured, SICK-STS3k) instead of 2,272-2,382 at
+# 1024 px: ~3x less prefill over the ~100k judged pairs.
+# -----------------------------------------------------------------------------
+judges:
+  - key: d1-qwen3.5-35b-a3b
+    model_id: /gs/fs/tga-kiban-arase/zhu/models/Qwen3.5-35B-A3B
+    backend: hf
+    prompt_set: image-v1
+    input: image
+    image_size: 512
+    enable_thinking: false        # hard requirement: no CoT
+    symmetrize: false
+    symmetry_check_sample: 256    # pairs re-scored with the two images swapped, per dataset
+    min_valid_mass: 0.05
+    batch_size: 8                 # pairs (16 images) per forward pass
+    max_prompt_tokens: 4096       # flagged if exceeded; never truncated
+    trust_remote_code: false
+    enabled: true
+    notes: "D1 main scorer. Needs transformers >= 5.16 plus pillow and torchvision."
+
+metrics:
+  bootstrap: 0
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  macro_average_over:
+    - cxc-val
+    - cxc-test
+    - sick-test
+    - sts3k

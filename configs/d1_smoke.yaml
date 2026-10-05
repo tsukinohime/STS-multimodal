@@ -1,0 +1,103 @@
+# =============================================================================
+# 32-pair smoke test for condition D1, laptop-sized.
+#
+#   python scripts/smoke_test.py --config configs/d1_smoke.yaml --d1
+#
+# Exercises every D1 code path — image store, generation, image embedding,
+# VLM judging, caches, resume, reports — with stand-ins that fit a 16 GB laptop:
+#
+#   generator  render-text: typesets each sentence onto a white canvas. No
+#              model; the VLM simply reads the text back, so the scores mean
+#              nothing about generation. FLUX.2 [klein] needs a GPU node:
+#              `tsubame/job_d1.sh imagine smoke` runs it on the real config.
+#   encoder    jina-embeddings-v5-omni-small with modality: vision (the real
+#              D1 encoder; ~3.5 GB download on first use).
+#   judge      Qwen3.5-0.8B: same family, processor and chat template as the
+#              35B judge (~1.7 GB download on first use).
+# =============================================================================
+
+experiment:
+  name: d1_smoke
+  condition: D1
+  output_dir: outputs/d1_smoke
+  seed: 42
+  limit: 32
+  resume: false
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: auto
+  dtype: auto
+  batch_size: 4
+  max_length: 512
+  cache_dir: .cache/d1_smoke
+  use_cache: true
+  flush_every: 16
+  progress: true
+  seed: 42
+
+images:
+  store_dir: .cache/images_smoke
+  flush_every: 64
+  preview_pairs: 2
+  generator:
+    key: render-text-512
+    model_id: none
+    backend: render-text
+    height: 512
+    width: 512
+    seed: 0
+    seed_policy: shared
+    batch_size: 16
+    image_format: png
+
+models:
+  - key: d1-jina-v5-omni-small
+    model_id: jinaai/jina-embeddings-v5-omni-small
+    backend: jina-v5
+    task: text-matching
+    prompt_name: document
+    modality: vision
+    input: image
+    image_size: null
+    batch_size: 4
+    enabled: true
+
+judges:
+  - key: d1-qwen3.5-0.8b-stub
+    model_id: Qwen/Qwen3.5-0.8B
+    backend: hf
+    prompt_set: image-v1
+    input: image
+    image_size: 256
+    enable_thinking: false
+    symmetry_check_sample: 16
+    min_valid_mass: 0.05
+    batch_size: 4
+    max_prompt_tokens: 4096
+    enabled: true
+    notes: "Pipeline-exercise judge only; its scores are not meaningful."
+
+metrics:
+  bootstrap: 200
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  macro_average_over:
+    - cxc-val
+    - cxc-test
+    - sick-test
+    - sts3k

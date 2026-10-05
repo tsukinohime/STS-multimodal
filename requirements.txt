@@ -34,8 +34,6 @@ tqdm>=4.66
 huggingface_hub>=0.24
 
 # ---------------------------------------------------------------------------
-# Not needed for the text-only milestone; add when the visual milestone lands
-# (jina-v5-omni with modality="vision" needs image decoding + preprocessing):
-#   pillow
-#   torchvision
+# Not needed for the text-only milestone. The image conditions (D1, ...) need
+# diffusers, pillow and torchvision: see requirements-images.txt.
 # ---------------------------------------------------------------------------

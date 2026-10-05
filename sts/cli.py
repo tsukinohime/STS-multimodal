@@ -2,6 +2,7 @@
 
     python -m sts.cli run      --config configs/text_only.yaml
     python -m sts.cli judge    --config configs/llm_judge.yaml
+    python -m sts.cli imagine  --config configs/d1_image_only.yaml   # sentences -> images (D1 stage 1)
     python -m sts.cli validate --config configs/smoke.yaml
     python -m sts.cli align    --config configs/text_only.yaml \
                                --model-a jina-v5-text-small --model-b jina-v5-omni-small
@@ -43,6 +44,8 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", type=Path, default=None, help="override experiment.output_dir")
     parser.add_argument("--data-root", type=Path, default=None, help="override data.root")
     parser.add_argument("--cache-dir", type=Path, default=None, help="override runtime.cache_dir")
+    parser.add_argument("--image-dir", type=Path, default=None,
+                        help="override images.store_dir (where generated images live)")
     parser.add_argument("--run-tag", default=None,
                         help="suffix for manifest/metrics/summary filenames; one per parallel job")
 
@@ -58,8 +61,20 @@ def _config_from(args: argparse.Namespace) -> ExperimentConfig:
         "output_dir": args.output_dir,
         "data_root": args.data_root,
         "cache_dir": args.cache_dir,
+        "image_dir": args.image_dir,
         "run_tag": args.run_tag,
     })
+
+
+def _tag_shared_output(config: ExperimentConfig, tag: str) -> None:
+    """Give ``run`` and ``judge`` distinct run tags when one config defines both.
+
+    They then write ``manifest__embedding.json`` and ``manifest__judge.json``
+    side by side instead of overwriting one ``manifest.json``; ``report`` merges
+    them. An explicit ``--run-tag`` always wins.
+    """
+    if not config.run_tag and config.models and config.judges:
+        config.run_tag = tag
 
 
 def _load_manifest(config: ExperimentConfig) -> dict:
@@ -110,11 +125,35 @@ def command_run(args: argparse.Namespace) -> int:
 
     config = _config_from(args)
     _apply_run_flags(config, args)
+    _tag_shared_output(config, "embedding")
     metrics = run_experiment(config)
     if metrics.empty:
         _log.error("No results produced.")
         return 1
     _finalise(metrics, config, method="embedding")
+    return 0
+
+
+def command_imagine(args: argparse.Namespace) -> int:
+    """Generate one image per unique sentence of the configured datasets (stage 1 of D1)."""
+    from .images.pipeline import run_generation
+
+    config = _config_from(args)
+    if config.images.generator is None:
+        _log.error("%s has no images.generator section.", config.source_path)
+        return 1
+    if args.preview is not None:
+        config.images.preview_pairs = args.preview
+    summary = run_generation(config)
+    print(f"\nGenerated images: {summary['store']}")
+    print(f"  sentences          {summary['n_unique_texts']:,} "
+          f"({summary['n_generated']:,} generated now, {summary['n_reused']:,} already stored)")
+    print(f"  store              {summary['store_images']:,} images in {summary['store_shards']} shard(s), "
+          f"{summary['store_gb']:.2f} GB")
+    print(f"  runtime            {summary['runtime_seconds']:.1f} s")
+    if summary["previews"]:
+        print(f"  previews           {summary['previews']}")
+    print(f"  manifest           {summary['manifest']}\n")
     return 0
 
 
@@ -124,6 +163,7 @@ def command_judge(args: argparse.Namespace) -> int:
 
     config = _config_from(args)
     _apply_run_flags(config, args)
+    _tag_shared_output(config, "judge")
     if not config.enabled_judges:
         _log.error("No enabled judges in %s (add a `judges:` list or check --models).", config.source_path)
         return 1
@@ -228,14 +268,22 @@ def command_cache(args: argparse.Namespace) -> int:
 
     config = _config_from(args)
     device = resolve_device(config.runtime.device)
+    store_hash = None
+    if any(m.input == "image" for m in config.enabled_models):
+        from .images.store import open_image_store
+
+        store_hash = open_image_store(config).fingerprint_hash
 
     total_files = total_bytes = 0
     for model_spec in config.enabled_models:
         dtype = resolve_dtype(model_spec.dtype or config.runtime.dtype, device)
+        fingerprint = {**model_spec.fingerprint(), "resolved_dtype": dtype}
+        if model_spec.input == "image":
+            fingerprint["images"] = store_hash
         cache = EmbeddingCache(
             cache_dir=config.runtime.cache_dir,
             model_key=model_spec.key,
-            fingerprint={**model_spec.fingerprint(), "resolved_dtype": dtype},
+            fingerprint=fingerprint,
             enabled=True,
         )
         if args.compact:
@@ -287,6 +335,16 @@ def build_parser() -> argparse.ArgumentParser:
     judge_parser.add_argument("--no-cache", action="store_true", help="bypass the judgment cache")
     judge_parser.add_argument("--bootstrap", type=int, default=None, help="bootstrap resamples for the CI")
     judge_parser.set_defaults(func=command_judge)
+
+    imagine_parser = subparsers.add_parser(
+        "imagine", help="generate one image per unique sentence (resumable; images are reused by "
+                        "every image condition)"
+    )
+    _add_common(imagine_parser)
+    imagine_parser.add_argument("--preview", type=int, default=None,
+                                help="pairs per dataset rendered to <output_dir>/images_preview/ "
+                                     "(overrides images.preview_pairs; 0 disables)")
+    imagine_parser.set_defaults(func=command_imagine)
 
     report_parser = subparsers.add_parser("report", help="rebuild metrics/summary from existing predictions")
     _add_common(report_parser)
@@ -340,8 +398,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    from .images.store import MissingImagesError
+
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except MissingImagesError as exc:
+        _log.error("%s", exc)
+        return 2
 
 
 if __name__ == "__main__":

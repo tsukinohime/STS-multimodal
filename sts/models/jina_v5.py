@@ -26,6 +26,13 @@ towers. Text embeddings are identical either way — the towers are separate
 parameters — so the text-only milestone gets the cheap load, and the visual
 milestone reloads the same repo with ``modality="vision"`` to obtain image
 embeddings in this very same space.
+
+Images go through the path the model card gives for non-retrieval tasks:
+the checkpoint's own processor with ``"Document: <|vision_start|><|image_pad|>
+<|vision_end|>"`` as the accompanying text, then ``model.embed(...)`` (last
+token, L2-normalised). ``embed()`` does not select an adapter the way
+``encode()`` does, so :meth:`JinaV5Encoder.encode_images` sets the task first —
+the image projector is task-specific too.
 """
 
 from __future__ import annotations
@@ -44,6 +51,11 @@ _DEFAULT_PROMPT = "document"
 #: The literal prefixes the checkpoints prepend, mirrored here only so token
 #: counts (and therefore truncation flags) are measured on the real input.
 _PROMPT_PREFIXES = {"query": "Query: ", "document": "Document: "}
+#: The processor expands the pad token into one token per merged image patch.
+_IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+#: Processor outputs the model's forward() takes for an image; newer processors
+#: add others (e.g. mm_token_type_ids) that this remote code does not expect.
+_IMAGE_INPUT_KEYS = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
 
 
 class JinaV5Encoder(TextEncoder):
@@ -112,6 +124,26 @@ class JinaV5Encoder(TextEncoder):
             )
         self.tokenizer = tokenizer
         self._dim: Optional[int] = None
+        self._processor = None
+        self._align_vision_dtype()
+
+    def _align_vision_dtype(self) -> None:
+        """Run the vision tower in the dtype of the image projectors that consume it.
+
+        The checkpoint builds its vision tower from a config that pins bfloat16,
+        while the task-specific projectors are created in the requested dtype.
+        Any other dtype (float32 off CUDA) leaves the two mismatched and the
+        projector matmul fails. A no-op for the bfloat16 runs on CUDA.
+        """
+        base = getattr(getattr(self.model, "base_model", None), "model", None)
+        visual = getattr(base, "visual", None)
+        mergers = getattr(base, "mergers", None)
+        if visual is None or mergers is None:
+            return
+        target = next(mergers.parameters()).dtype
+        if visual.dtype != target:
+            _log.info("Casting the vision tower %s -> %s to match the image projectors", visual.dtype, target)
+            visual.to(target)
 
     @property
     def dim(self) -> int:
@@ -171,6 +203,39 @@ class JinaV5Encoder(TextEncoder):
             token_counts=counts,
             truncated=counts > self.max_length,
         )
+
+    # -- images --------------------------------------------------------------
+    def _image_processor(self):
+        if self._processor is None:
+            if self.modality in ("text", "audio"):
+                raise ValueError(
+                    f"{self.key}: modality={self.modality!r} loads no vision tower; "
+                    "set modality: vision (or omni) to embed images"
+                )
+            from transformers import AutoProcessor
+
+            self._processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+            # embed() pools at attention_mask.sum() - 1: correct for right padding only.
+            self._processor.tokenizer.padding_side = "right"
+        return self._processor
+
+    def encode_images(self, images: Sequence) -> np.ndarray:
+        """Unit-norm embeddings of PIL images, in order, under this encoder's task and prompt."""
+        images = list(images)
+        if not images:
+            return np.zeros((0, 0), dtype=np.float32)
+        processor = self._image_processor()
+        text = f"{_PROMPT_PREFIXES[self.prompt_name]}{_IMAGE_PLACEHOLDER}"
+        chunks: List[np.ndarray] = []
+        with self._torch.no_grad():
+            self.model.set_adapter([self.task])
+            for batch in batched(images, self.batch_size):
+                inputs = processor(images=list(batch), text=[text] * len(batch),
+                                   padding=True, return_tensors="pt")
+                inputs = {key: inputs[key].to(self.device) for key in _IMAGE_INPUT_KEYS}
+                vectors = self.model.embed(truncate_dim=self.truncate_dim, **inputs)
+                chunks.append(vectors.float().cpu().numpy())
+        return l2_normalize(np.concatenate(chunks, axis=0).astype(np.float32))
 
     def describe(self) -> dict:
         return {

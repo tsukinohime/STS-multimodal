@@ -1,0 +1,23 @@
+# Extra requirements for the image conditions (D1: configs/d1_image_only.yaml).
+#
+# Apply to an EXISTING env. The first line pulls in requirements-judge.txt, since
+# the D1 judge is the same Qwen3.5 checkpoint (transformers >= 5.16). Hold torch
+# at the installed version on the command line, otherwise pip may upgrade torch
+# to satisfy the newest torchvision:
+#
+#     pip install -r requirements-images.txt \
+#         "torch==$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
+#     python -c "import diffusers, torchvision, PIL; print(diffusers.__version__, torchvision.__version__)"
+-r requirements-judge.txt
+
+# Flux2KleinPipeline (FLUX.2 [klein]). Verified with 0.40.0, which also takes
+# `dtype=` in from_pretrained (`torch_dtype=` is deprecated there).
+diffusers>=0.40
+
+# Image store, previews, and the processors' image inputs.
+pillow>=10.1
+
+# The Qwen-VL-family image processors (jina-v5-omni, Qwen3.5) run on the
+# torchvision backend. Each torchvision release pins one torch release
+# (torch 2.13 <-> torchvision 0.28), hence the torch pin in the command above.
+torchvision

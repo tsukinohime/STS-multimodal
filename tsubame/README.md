@@ -214,6 +214,68 @@ the embedding run wrote elsewhere (a group-storage `STS_OUTPUT_DIR`), pass
 directory is missing. Tables go to `outputs/llm_judge/full/breakdown/`; run
 `bash tsubame/job_breakdown.sh --help` for every variable.
 
+## Condition D1: generated image only
+
+`job_d1.sh STAGE [smoke [N] | full]` runs one stage of `configs/d1_image_only.yaml`
+per job (details: main README, "Condition D1"):
+
+| stage | what it does | resources |
+|-------|--------------|-----------|
+| `imagine` | FLUX.2 [klein] 4B makes one image per unique sentence (~60k for the full run) into the image store | GPU; bf16 weights ~15 GB, so a half-GPU MIG slice (`gpu_h` / `node_o`) should hold it |
+| `embed` | jina-v5-omni cosine between the two images of each pair | GPU, small |
+| `judge` | Qwen3.5-35B-A3B shown the two images | a whole GPU (`gpu_1` / `node_q`): bf16 weights ~70 GB |
+| `report` | merges `embed` and `judge` into one summary | CPU only |
+
+Once, on the login node:
+
+```bash
+pip install -r requirements-images.txt \
+    "torch==$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
+STS_CONFIG=configs/d1_image_only.yaml bash tsubame/prefetch_models.sh   # FLUX.2-klein-4B (+ jina)
+```
+
+The prefetch downloads only the pipeline's component folders of FLUX.2-klein-4B,
+not the repository's extra single-file checkpoint. The judge's `model_id` in
+`d1_image_only.yaml` is the same local directory as in `llm_judge.yaml`; change
+both if it moves. Point `STS_IMAGE_DIR` at group storage: the full store is
+~30 GB in ~120 tar shards.
+
+Smoke first. Its images land in the shared store and are reused by the full run:
+
+```bash
+py="$(command -v python)"; img=/gs/bs/<group>/sts/images     # your group storage
+id=$(qsub -terse -g <group> -l <resource>=1 -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d1.sh imagine smoke)
+qsub -g <group> -l <resource>=1 -hold_jid "$id" -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d1.sh embed smoke
+qsub -g <group> -l <resource>=1 -hold_jid "$id" -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d1.sh judge smoke
+```
+
+Look at `outputs/d1_image_only/smoke_32/images_preview/` before going further.
+The smoke logs also give the throughput for sizing `h_rt`: `imagine.json`
+records `images_per_second`, and each manifest records `pairs_per_second` per
+dataset. Scale those to ~60k images and ~100k judged pairs. Every stage is
+resumable, so an `h_rt` kill only loses the unflushed block (512 images or
+pairs); resubmit the same command to continue.
+
+```bash
+id=$(qsub -terse -g <group> -l <resource>=1 -l h_rt=<HH:MM:SS> -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d1.sh imagine full)
+qsub -g <group> -l <resource>=1 -l h_rt=<HH:MM:SS> -hold_jid "$id" -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d1.sh embed full
+qsub -g <group> -l <resource>=1 -l h_rt=<HH:MM:SS> -hold_jid "$id" -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d1.sh judge full
+# after both: one summary (CPU)
+qsub -g <group> -l <cpu resource>=1 -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d1.sh report full
+```
+
+To spread a stage over several GPUs at once, give each job a slice of the
+datasets with `STS_D1_DATASETS`, e.g. `"cxc-val"`, `"cxc-test"` and
+`"sick-all sick-test sts3k"` (sick-test is a subset of sick-all, so keep them in
+one job). Concurrent `imagine` jobs share one store safely. Concurrent `embed` /
+`judge` jobs each get their own cache directory automatically.
+Grid Engine's `-v` splits on commas, so quote the value without commas:
+`-v STS_PYTHON="$py",STS_D1_DATASETS="cxc-val"`.
+
+Outputs: `outputs/d1_image_only/{smoke_N,full}/`, laid out like the text
+runs (predictions, metrics, summary, prompts), plus `imagine__<jobid>.json`,
+which records the generator, its settings, the store and the throughput.
+
 ## Run (embedding)
 
 ```bash

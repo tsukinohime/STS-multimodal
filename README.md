@@ -5,8 +5,10 @@ two texts, can images generated from each text (used as a caption for an
 image-generation model) provide extra semantic information that helps the STS
 task?**
 
-This repository currently holds **Milestone 1 — the text-only baseline** that
-every later multimodal result is compared against. No images are involved yet.
+This repository holds **Milestone 1 — the text-only baselines** that every
+multimodal result is compared against (embedding cosine, and an LLM judge), and
+the first image condition, **D1: generated image only** (see
+[below](#condition-d1-generated-image-only)).
 
 ## What Milestone 1 does
 
@@ -196,6 +198,9 @@ python -m sts.cli validate --config configs/text_only.yaml
 python -m sts.cli datasets
 ```
 
+Image conditions add `imagine` (generate the images) and `--image-dir` (where
+they live); see [Condition D1](#condition-d1-generated-image-only).
+
 Useful flags: `--limit N`, `--device {auto,cuda,mps,cpu}`, `--dtype`,
 `--batch-size`, `--bootstrap 1000`, `--no-resume`, `--no-cache`,
 `--output-dir`, `--run-tag`.
@@ -301,6 +306,103 @@ python -m sts.cli breakdown --config configs/llm_judge.yaml \
 ```
 
 On TSUBAME, `tsubame/job_breakdown.sh` runs exactly this as a CPU job.
+
+## Condition D1: generated image only
+
+How much of a pair's meaning survives text → image → model? Each sentence is
+given to a frozen text-to-image model, and only the two generated images are
+scored; no scorer ever sees the sentences. Datasets, splits, categories, seed,
+metrics, macro average and the prediction schema are the text baselines', so
+`report` and `breakdown` work unchanged.
+
+```bash
+python -m sts.cli imagine --config configs/d1_image_only.yaml   # 1.  one image per unique sentence
+python -m sts.cli run     --config configs/d1_image_only.yaml   # 2a. image-embedding cosine
+python -m sts.cli judge   --config configs/d1_image_only.yaml   # 2b. VLM judge on the two images
+python -m sts.cli report  --config configs/d1_image_only.yaml   # one summary for both scorers
+python scripts/smoke_test.py --config configs/d1_smoke.yaml --d1   # laptop smoke test, stand-in models
+```
+
+Extra dependencies: `pip install -r requirements-images.txt` (diffusers,
+pillow, torchvision; see the file for holding torch at its version).
+
+**Stage 1: `imagine`.** The unique sentences of the configured datasets (after
+any `--limit` subsampling, with the scoring commands' seed) each get one image
+from **FLUX.2 [klein] 4B** (`black-forest-labs/FLUX.2-klein-4B`, Apache-2.0)
+through diffusers' `Flux2KleinPipeline`: 1024×1024, 4 steps (the checkpoint is
+step-distilled), guidance 1.0 (ignored by the distilled checkpoint), bf16. The
+full run is ~60k sentences (CxC 49.5k, SICK 6.1k, STS3k 4.4k), generated once and
+reused by every image condition.
+
+* *Seeds.* `seed_policy: shared` (default) starts every sentence from the same
+  noise, so two images differ only through what the two texts change rather
+  than also through an unrelated random layout; `per-text` derives an
+  independent seed from each sentence. Each prompt gets its own CPU generator,
+  so an image depends on its sentence alone: batched and single generation give
+  pixel-identical images (checked on CPU).
+* *Store.* [sts/images/store.py](sts/images/store.py) keeps images in
+  uncompressed tar shards of `images.flush_every` (512) images, ~120 files for
+  the full run instead of ~60k inodes. Members are named by the SHA-1 of the
+  sentence; the directory by a hash of every generator setting, so changing
+  any of them starts a new store instead of mixing images. Shards are written
+  atomically under unique names, so a killed job loses at most one shard and
+  several `imagine` jobs (one per dataset) can fill one store at once. Each
+  shard's `index.json` maps members back to sentence and seed; `tar -xf` gets
+  any image back.
+* *Format.* JPEG q95 with 4:4:4 chroma, ~0.5 MB per image vs ~1.6 MB for PNG
+  (measured on one FLUX sample photo): ~30 GB vs ~95 GB for the full run. The
+  scorers resize every image anyway. `image_format: png` is lossless.
+* *Previews.* `<output_dir>/images_preview/` shows four pairs per dataset (both
+  CxC sampling methods) side by side with their sentences and gold score.
+
+**Stage 2a: image-embedding cosine.** `jina-embeddings-v5-omni-small` with
+`modality: vision`, the `text-matching` adapter and the `Document: ` prompt,
+through the checkpoint's own processor and `embed()`. That is the path the
+model card gives for non-retrieval tasks. It is the text baseline's main
+encoder, so the image cosine sits in the same space as the text cosine. Images
+go in as generated (1024 px → 1024 image tokens).
+
+**Stage 2b: VLM judge.** The same Qwen3.5-35B-A3B checkpoint as the text judge,
+loaded with its vision encoder. The text judge's `AutoModelForCausalLM`
+resolves the checkpoint to `Qwen3_5MoeForCausalLM`, the language model alone
+(vision weights skipped). `AutoModelForImageTextToText` resolves the same
+files to `Qwen3_5MoeForConditionalGeneration`, whose language-model weights are
+the same tensors. Prompt set `image-v1`
+([sts/judge/prompts.py](sts/judge/prompts.py)) is the v1 prompt verbatim
+(system prompt, instruction, anchors, scale, answer line). The sentence pair
+block is replaced by the two images, preceded by one fixed sentence:
+
+> The sentences themselves are not shown. Each sentence was given to a
+> text-to-image model, and the image it generated is shown in its place. Base
+> your rating on the two images alone.
+
+The rating target therefore stays the meaning of the *sentences*, the
+construct the gold scores measure, now judged through their images. No
+sentence text reaches the prompt; the smoke test checks every dumped prompt.
+Thinking off, one forward pass, digit expectation, `min_valid_mass`: all as for
+the text judge. The order-symmetry check swaps the two images. `image_size: 512`
+resizes each image to 512 px (256 image tokens), so a pair costs 736–846 prompt
+tokens (SICK–STS3k, measured) instead of 2,272–2,382 at 1024 px. Its prediction
+rows also carry `input`, `image_size`, `image_store` and `generator`.
+
+**Caches** live in `.cache/d1/`. Their fingerprints include the image-store
+hash, so image embeddings and image judgments never mix with text ones or with
+another generator's images. Text configs keep their old fingerprints: existing
+caches stay valid. When one config defines both encoders and judges, `run` and
+`judge` default to the run tags `embedding` / `judge`, so the two write side by
+side and `report` merges them.
+
+**Against the text conditions.** Each system has its own key (`d1-…`), so it
+lines up with the text runs pair by pair:
+
+```bash
+python -m sts.cli breakdown --config configs/d1_image_only.yaml \
+    --datasets sick-all sick-test cxc-val cxc-test \
+    --baseline outputs/text_only --baseline outputs/llm_judge/full
+```
+
+On TSUBAME, `tsubame/job_d1.sh` runs each stage as its own job; see
+[tsubame/README.md](tsubame/README.md#condition-d1-generated-image-only).
 
 Per system and label: Spearman/Pearson within the label, the pooled Spearman
 with that label left out, the mean rank offset rank(pred) − rank(gold) (where a
@@ -438,16 +540,22 @@ sts/
   diagnostics.py   validation checks + cross-model alignment probe
   breakdown.py     results by SICK NLI label / CxC sampling_method, from predictions on disk
   cli.py           command-line entry point
-  judge/           LLM-as-judge: prompts.py (specs + hashes), scorer.py
-                   (next-token expectation), pipeline.py (orchestration)
+  judge/           LLM-as-judge: prompts.py (specs + hashes; text v1 and image-v1),
+                   scorer.py (next-token expectation), vlm.py (the same, shown
+                   two generated images), pipeline.py (orchestration)
+  images/          generated images: store.py (sharded tar store), generators.py
+                   (FLUX.2 [klein], render-text stand-in), pipeline.py (`imagine`)
+  models/images.py image input for an encoder: sentences -> their images' embeddings
 configs/
   text_only.yaml   the full embedding experiment
   smoke.yaml       32 pairs/dataset, laptop-sized
   llm_judge.yaml   the full LLM-as-judge experiment
   llm_judge_smoke.yaml   its 32-pair smoke test (0.5B stand-in judge)
+  d1_image_only.yaml     condition D1: FLUX.2 [klein] images, jina-v5-omni + Qwen3.5 judge
+  d1_smoke.yaml          its 32-pair smoke test (render-text images, Qwen3.5-0.8B judge)
 scripts/
-  smoke_test.py    run twice + validate everything
+  smoke_test.py    run twice + validate everything (--judge, --d1)
 tsubame/
   README.md  env.sh.example  activate_env.sh  prefetch_models.sh
-  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh
+  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh  job_d1.sh
 ```

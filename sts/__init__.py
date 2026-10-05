@@ -4,11 +4,13 @@ Research premise: when measuring semantic textual similarity between two texts,
 can images generated from each text (used as a caption for an image-generation
 model) supply extra semantic information that helps the task?
 
-This package is the **text-only baseline** every later multimodal result is
-compared against. Pipeline: sentence pair -> frozen pretrained encoder ->
-L2-normalised embeddings -> cosine similarity -> Spearman (headline) and
-Pearson correlation against human gold scores. Nothing is trained, fine-tuned,
-regressed or calibrated, and no decision is made on a test split.
+The text-only baselines every multimodal result is compared against: sentence
+pair -> frozen pretrained encoder -> L2-normalised embeddings -> cosine
+similarity (or a frozen LLM judge) -> Spearman (headline) and Pearson
+correlation against human gold scores. On top of them, condition D1 scores the
+images a text-to-image model generates from the two sentences instead of the
+sentences. Nothing is trained, fine-tuned, regressed or calibrated, and no
+decision is made on a test split.
 
 Modules
 -------
@@ -22,6 +24,8 @@ Modules
 ``manifest``     reproducibility record
 ``report``       metrics CSV/JSON + markdown summary
 ``diagnostics``  validation checks and the cross-model alignment probe
+``judge``        LLM-as-judge (text) and its vision-language variant (images)
+``images``       generated-image store, text-to-image generators, ``imagine`` stage
 ``cli``          command-line entry point
 """
 

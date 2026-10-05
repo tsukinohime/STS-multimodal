@@ -17,6 +17,15 @@ Scales differ across datasets (CxC 0–5, SICK 1–5, STS3k 1–7) because that 
 what the guidelines define. Spearman is invariant to the scale, so this costs
 nothing for the comparison across datasets. Changing a scale means writing a
 new spec version, which is the point: the hash changes with it.
+
+**Image-only variants** (``image-v1``, condition D1) change exactly one thing:
+the sentence pair block is replaced by the two images a text-to-image model
+generated from the sentences, preceded by one fixed sentence saying so. System
+prompt, instruction, anchors, scale and answer line are the v1 text verbatim,
+so D1 differs from the text judge (B1) only in what represents the pair. The
+rating target stays the meaning of the *sentences* — the construct the gold
+scores measure — judged through their images. No sentence text reaches the
+prompt.
 """
 
 from __future__ import annotations
@@ -184,9 +193,78 @@ _STS3K_V1 = PromptSpec(
     notes="Authors deliberately provided no rating framework; none is added here.",
 )
 
+# --------------------------------------------------------------------------- #
+# image-v1 — condition D1: the v1 prompts, the sentences replaced by their images
+# --------------------------------------------------------------------------- #
+_IMAGE_NOTE = (
+    "The sentences themselves are not shown. Each sentence was given to a text-to-image model, "
+    "and the image it generated is shown in its place. Base your rating on the two images alone."
+)
+
+
+@dataclass(frozen=True)
+class ImagePairPromptSpec(PromptSpec):
+    """A text spec whose pair block shows two generated images instead of two sentences.
+
+    A subclass, so the base class — and the hash of every text spec — is untouched.
+    """
+
+    input: str = "image"
+    modality_note: str = _IMAGE_NOTE
+
+    def _lead(self) -> str:
+        return "\n\n".join([self.instruction, self.modality_note, "Image pair:"])
+
+    def render_user(self, sentence_a: str, sentence_b: str) -> str:
+        """The user turn as text, images shown as placeholders (for the hash and dumps).
+
+        The sentences are deliberately unused: they never reach the prompt.
+        """
+        return f"{self._lead()}\n- {{image_a}}\n- {{image_b}}\n\n{_answer_line(self.scale)}"
+
+    def messages(self, sentence_a: str, sentence_b: str) -> list:
+        """Chat messages with two image slots, filled in order with the images of a then b."""
+        content = [
+            {"type": "text", "text": f"{self._lead()}\n- "},
+            {"type": "image"},
+            {"type": "text", "text": "\n- "},
+            {"type": "image"},
+            {"type": "text", "text": f"\n\n{_answer_line(self.scale)}"},
+        ]
+        return [
+            {"role": "system", "content": self.system},
+            {"role": "user", "content": content},
+        ]
+
+
+def _image_variant(spec: PromptSpec, version: str) -> ImagePairPromptSpec:
+    return ImagePairPromptSpec(
+        family=spec.family,
+        version=version,
+        scale=spec.scale,
+        system=spec.system,
+        instruction=spec.instruction,
+        source=spec.source + (
+            " Image-only variant (D1): this instruction verbatim; the pair block shows the two images "
+            "generated from the sentences instead of the sentences."
+        ),
+        notes=spec.notes,
+    )
+
+
 PROMPT_SETS: Dict[str, Dict[str, PromptSpec]] = {
     "v1": {"cxc": _CXC_V1, "sick": _SICK_V1, "sts3k": _STS3K_V1},
+    "image-v1": {
+        "cxc": _image_variant(_CXC_V1, "image-v1"),
+        "sick": _image_variant(_SICK_V1, "image-v1"),
+        "sts3k": _image_variant(_STS3K_V1, "image-v1"),
+    },
 }
+
+
+def input_of(spec: PromptSpec) -> str:
+    """``image`` for an image-pair spec, ``text`` otherwise."""
+    return getattr(spec, "input", "text")
 
 
 def family_of(dataset_name: str) -> str:

@@ -109,6 +109,21 @@ METHOD_TEXT = {
     ),
 }
 
+#: Experimental conditions that replace the method paragraph (``experiment.condition``).
+CONDITION_TEXT = {
+    "D1": (
+        "D1: generated image only",
+        "Each sentence is given to a frozen text-to-image model, and only the two generated "
+        "images are compared; no scorer ever sees the sentences. Two scorers: a vision-language "
+        "judge shown the two images with the dataset's own rating guidelines (the text judge's "
+        "prompt verbatim, the sentence pair replaced by the images; the prediction is the "
+        "expectation over the answer digits, as for the text judge), and the cosine between "
+        "image embeddings. The gap to the text conditions measures how much of a pair's meaning "
+        "survives the text -> image -> model round trip. Nothing is trained, calibrated or "
+        "tuned on any split. Generator and image settings are in the Models table.",
+    ),
+}
+
 
 def build_markdown_summary(
     metrics: pd.DataFrame,
@@ -123,7 +138,9 @@ def build_markdown_summary(
     runs = manifest.get("runs", [])
     models_meta = manifest.get("models", {})
     datasets_meta = manifest.get("datasets", {})
-    title_suffix, method_text = METHOD_TEXT.get(method, METHOD_TEXT["embedding"])
+    title_suffix, method_text = (
+        CONDITION_TEXT.get(config.condition) or METHOD_TEXT.get(method, METHOD_TEXT["embedding"])
+    )
 
     lines: List[str] = [
         f"# {config.name} — {title_suffix}",
@@ -282,15 +299,12 @@ def build_markdown_summary(
             ],
         ))
 
-    lines += [
-        "",
-        "## Reproduce",
-        "",
-        "```bash",
-        f"python -m sts.cli run --config {config.source_path}",
-        "```",
-        "",
-    ]
+    if config.images.generator is not None:
+        commands = [f"python -m sts.cli {step} --config {config.source_path}"
+                    for step in ("imagine", "run", "judge", "report")]
+    else:
+        commands = [f"python -m sts.cli {'judge' if method == 'judge' else 'run'} --config {config.source_path}"]
+    lines += ["", "## Reproduce", "", "```bash", *commands, "```", ""]
     return "\n".join(lines)
 
 

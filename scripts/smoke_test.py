@@ -3,6 +3,7 @@
 
     python scripts/smoke_test.py --config configs/smoke.yaml                 # encoders
     python scripts/smoke_test.py --config configs/llm_judge_smoke.yaml --judge   # LLM judge
+    python scripts/smoke_test.py --config configs/d1_smoke.yaml --d1          # D1: images
 
 What it proves, in order:
 
@@ -19,6 +20,11 @@ What it proves, in order:
    breaks the ties an argmax answer would leave.
 5. One config file plus one command reproduces the whole thing.
 
+With ``--d1`` each run is three stages — ``imagine``, then ``run`` and ``judge``
+on the generated images — and three more checks apply: every sentence has an
+image, a second ``imagine`` generates nothing, and no sentence text reaches an
+image-only prompt while both images do.
+
 Exit code is 0 only if everything passed.
 """
 
@@ -26,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -79,6 +86,15 @@ def cache_totals(manifest_path: Path, by_family: bool = False) -> Tuple[int, int
     return hits, misses
 
 
+def stage_cache_totals(output_dir: Path, d1: bool, judge: bool) -> Tuple[int, int]:
+    """Cache hits/misses of this run; a D1 run has one manifest per scoring stage."""
+    if not d1:
+        return cache_totals(output_dir / "manifest.json", by_family=judge)
+    hits_e, misses_e = cache_totals(output_dir / "manifest__embedding.json")
+    hits_j, misses_j = cache_totals(output_dir / "manifest__judge.json", by_family=True)
+    return hits_e + hits_j, misses_e + misses_j
+
+
 def read_predictions(output_dir: Path) -> dict:
     return {
         str(path.relative_to(output_dir)): pd.read_csv(path)
@@ -88,7 +104,7 @@ def read_predictions(output_dir: Path) -> dict:
 
 def judge_checks(output_dir: Path) -> List[CheckResult]:
     """Invariants specific to LLM-judge predictions (there is no encoder to probe)."""
-    frames = read_predictions(output_dir)
+    frames = {name: f for name, f in read_predictions(output_dir).items() if "expected_score" in f}
     results: List[CheckResult] = []
 
     # 1. Every row carries a prompt hash, one per file, consistent within a
@@ -157,6 +173,68 @@ def judge_checks(output_dir: Path) -> List[CheckResult]:
     return results
 
 
+def d1_checks(config, output_dir: Path, warm_generated: Optional[int]) -> List[CheckResult]:
+    """Invariants of the image conditions: complete store, stable store, image-only prompts."""
+    from sts.images.pipeline import load_datasets
+    from sts.images.store import open_image_store, visual_tokens
+    from sts.judge.prompts import PROMPT_SETS
+
+    results: List[CheckResult] = []
+    store = open_image_store(config)
+    texts = list(dict.fromkeys(t for d in load_datasets(config).values() for t in d.unique_texts()))
+    missing = [t for t in texts if t not in store]
+    results.append(CheckResult(
+        name="every_sentence_has_a_generated_image",
+        passed=not missing,
+        detail=f"{len(texts) - len(missing)}/{len(texts)} sentences have an image in {store.directory.name}",
+    ))
+    results.append(CheckResult(
+        name="image_store_reused_after_restart",
+        passed=warm_generated == 0,
+        detail=f"second `imagine` generated {warm_generated} image(s)",
+    ))
+
+    # No sentence text may reach an image-only prompt: by construction (the
+    # specs render without the sentences) and in every prompt actually dumped.
+    leaks = []
+    image_judges = [j for j in config.enabled_judges if j.input == "image"]
+    for prompt_set in {j.prompt_set for j in image_judges}:
+        for family, spec in PROMPT_SETS[prompt_set].items():
+            if "SENTINEL" in json.dumps(spec.messages("SENTINEL_A", "SENTINEL_B")):
+                leaks.append(f"{prompt_set}/{family} spec")
+    dumps = sorted((output_dir / "prompts").glob("*__image-*.md"))
+    for dump in dumps:
+        text = dump.read_text(encoding="utf-8")
+        pair_id = re.search(r"pair `([^`]+)`", text).group(1)
+        pairs = pd.read_csv(output_dir / "pairs" / f"{pair_id.rsplit('-', 1)[0]}.csv").set_index("pair_id")
+        rendered = text.split("exactly as tokenised", 1)[1]
+        if any(str(pairs.loc[pair_id, column]) in rendered for column in ("sentence1", "sentence2")):
+            leaks.append(dump.name)
+    results.append(CheckResult(
+        name="image_prompts_contain_no_sentence_text",
+        passed=not leaks and bool(dumps),
+        detail=f"{len(dumps)} dumped image prompt(s) and every image spec checked" if not leaks
+        else f"sentence text found in {leaks}",
+    ))
+
+    # Both images reached the judge: each prompt is at least two images long.
+    short = []
+    for judge in image_judges:
+        per_image = visual_tokens(store.fingerprint["width"], store.fingerprint["height"], judge.image_size)
+        for path in sorted((output_dir / "predictions" / judge.key).glob("*.csv")):
+            shortest = int(pd.read_csv(path)["prompt_tokens"].min())
+            if shortest < 2 * per_image:
+                short.append(f"{path.name}: {shortest} < 2 x {per_image}")
+    results.append(CheckResult(
+        name="judge_prompts_carry_two_images",
+        passed=not short and bool(image_judges),
+        detail="every image-judge prompt holds at least two images' worth of image tokens" if not short
+        else "; ".join(short),
+    ))
+    store.close()
+    return results
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", "-c", type=Path, default=REPO_ROOT / "configs" / "smoke.yaml")
@@ -168,14 +246,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="do not clear this config's embedding cache first (skips the cold-run check)")
     parser.add_argument("--judge", action="store_true",
                         help="smoke-test the LLM-as-judge pipeline (`sts.cli judge`) instead of the encoder one")
+    parser.add_argument("--d1", action="store_true",
+                        help="smoke-test condition D1: `imagine`, then `run` and `judge` on the generated images")
     args = parser.parse_args(argv)
-    subcommand = "judge" if args.judge else "run"
+    if args.d1 and args.judge:
+        parser.error("--d1 already covers the judge; pass one of --judge / --d1")
+    stages = ["imagine", "run", "judge"] if args.d1 else ["judge" if args.judge else "run"]
 
     config = load_config(args.config, overrides={
         "models": args.models, "device": args.device, "data_root": args.data_root,
     })
     output_dir = config.output_dir
-    manifest_path = output_dir / "manifest.json"
 
     passthrough: List[str] = ["--config", str(args.config)]
     if args.models:
@@ -200,15 +281,38 @@ def main(argv: Optional[List[str]] = None) -> int:
         for key in keys:
             for directory in config.runtime.cache_dir.glob(f"{key}__*"):
                 shutil.rmtree(directory, ignore_errors=True)
+        generator = config.images.generator
+        if args.d1 and generator is not None and generator.backend == "render-text":
+            # Only the model-free stand-in's images are cheap enough to throw
+            # away; a real generator's store is shared with the full run.
+            from sts.images.store import open_image_store
+
+            shutil.rmtree(open_image_store(config).directory, ignore_errors=True)
+
+    def run_stages(extra: List[str], note: str) -> Tuple[int, float]:
+        total = 0.0
+        for stage in stages:
+            flags = extra if stage != "imagine" else []
+            code, seconds = run_cli([stage, *passthrough, *flags], note)
+            total += seconds
+            if code != 0:
+                return code, total
+        return 0, total
+
+    def generated_now() -> Optional[int]:
+        path = output_dir / "imagine.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))["runs"][-1]["n_generated"]
 
     extra_checks: List[CheckResult] = []
 
     # ---- 1. cold run -------------------------------------------------------
-    code, cold_seconds = run_cli([subcommand, *passthrough], "cold: empty cache")
+    code, cold_seconds = run_stages([], "cold: empty cache")
     if code != 0:
         print(f"\nFAIL: the cold run exited with code {code}")
         return 1
-    cold_hits, cold_misses = cache_totals(manifest_path, by_family=args.judge)
+    cold_hits, cold_misses = stage_cache_totals(output_dir, args.d1, args.judge)
     cold_predictions = read_predictions(output_dir)
     extra_checks.append(CheckResult(
         name="cold_run_completes",
@@ -219,13 +323,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ))
 
     # ---- 2. warm run in a fresh process ------------------------------------
-    code, warm_seconds = run_cli(
-        [subcommand, *passthrough, "--no-resume"], "warm: separate process, cache on disk"
-    )
+    code, warm_seconds = run_stages(["--no-resume"], "warm: separate process, cache on disk")
     if code != 0:
         print(f"\nFAIL: the warm run exited with code {code}")
         return 1
-    warm_hits, warm_misses = cache_totals(manifest_path, by_family=args.judge)
+    warm_generated = generated_now()
+    warm_hits, warm_misses = stage_cache_totals(output_dir, args.d1, args.judge)
     extra_checks.append(CheckResult(
         name="cache_reused_after_restart",
         passed=warm_misses == 0 and warm_hits > 0,
@@ -265,11 +368,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # The encoder checks (cos(x,x)=1, order invariance) are properties of an
     # embedding space; a judge is checked through its predictions instead.
     checks = run_validation(config, encoder_checks=not args.judge, sample=16)
-    if args.judge:
+    if args.judge or args.d1:
         checks.extend(judge_checks(output_dir))
+    if args.d1:
+        checks.extend(d1_checks(config, output_dir, warm_generated))
 
     # ---- 5. single-command reproduction ------------------------------------
-    reproduce = f"python -m sts.cli {subcommand} --config {args.config}"
+    reproduce = " && ".join(f"python -m sts.cli {stage} --config {args.config}" for stage in stages)
     extra_checks.append(CheckResult(
         name="single_command_reproduces_the_run",
         passed=args.config.exists(),
