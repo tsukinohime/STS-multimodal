@@ -231,14 +231,27 @@ Once, on the login node:
 ```bash
 pip install -r requirements-images.txt \
     "torch==$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
-STS_CONFIG=configs/d1_image_only.yaml bash tsubame/prefetch_models.sh   # FLUX.2-klein-4B (+ jina)
+# FLUX.2-klein-4B to group storage (~15 GB), the directory images.generator.model_id names
+hf download black-forest-labs/FLUX.2-klein-4B --exclude flux-2-klein-4b.safetensors \
+    --local-dir /gs/fs/tga-kiban-arase/zhu/models/FLUX.2-klein-4B
+STS_CONFIG=configs/d1_image_only.yaml bash tsubame/prefetch_models.sh   # jina; checks both local dirs
 ```
 
-The prefetch downloads only the pipeline's component folders of FLUX.2-klein-4B,
-not the repository's extra single-file checkpoint. The judge's `model_id` in
-`d1_image_only.yaml` is the same local directory as in `llm_judge.yaml`; change
-both if it moves. Point `STS_IMAGE_DIR` at group storage: the full store is
-~30 GB in ~120 tar shards.
+The repository lives wherever you like (home, work area); the models are read
+from the absolute paths in the YAML. `--exclude` skips the transformer's 7.2 GB
+single-file copy at the repo root, which diffusers does not read. Prefetch does
+not download local directories but checks them: every component folder of the
+pipeline (and every weight shard of the judge) present, no interrupted
+download. It ends with `OK … revision <commit>` per model. That commit is the
+one `hf download` recorded, and the run manifests record it too.
+
+The generator's `model_id` is part of the image-store name, so settle the path
+before the first `imagine` and keep it identical in every config that reads the
+images; after moving the weights the old store is no longer found. (The Hub id
+works as well: then prefetch puts FLUX in the HF cache under `HF_HOME`.) The
+judge's `model_id` in `d1_image_only.yaml` is the same local directory as in
+`llm_judge.yaml`; change both if it moves. Point `STS_IMAGE_DIR` at group
+storage: the full store is ~30 GB in ~120 tar shards.
 
 Smoke first. Its images land in the shared store and are reused by the full run:
 

@@ -71,8 +71,16 @@ images:
   preview_pairs: 4            # pairs per dataset drawn side by side in <output_dir>/images_preview/
   generator:
     key: flux2-klein-4b
-    # A local directory works too (e.g. a copy on group storage).
-    model_id: black-forest-labs/FLUX.2-klein-4B
+    # black-forest-labs/FLUX.2-klein-4B, downloaded to group storage once, on a
+    # login node, in the diffusers layout (model_index.json + component folders):
+    #   hf download black-forest-labs/FLUX.2-klein-4B --exclude flux-2-klein-4b.safetensors \
+    #       --local-dir /gs/fs/tga-kiban-arase/zhu/models/FLUX.2-klein-4B
+    # The excluded file is the transformer again as one 7.2 GB file for other
+    # tools; diffusers does not read it. The Hub id itself also works, from the
+    # HF cache that prefetch_models.sh fills.
+    # model_id is part of the image-store name: settle it before the first
+    # imagine run and keep it identical in every config that reads the images.
+    model_id: /gs/fs/tga-kiban-arase/zhu/models/FLUX.2-klein-4B
     backend: flux2-klein
     height: 1024              # the resolution klein is tuned and tested at
     width: 1024

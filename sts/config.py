@@ -251,7 +251,9 @@ class GeneratorSpec:
 
     def fingerprint(self) -> Dict[str, Any]:
         fingerprint = {
-            "model_id": self.model_id,
+            # One local directory spelled two ways (a trailing slash, say) must
+            # name one store; normpath leaves a Hub id as it is.
+            "model_id": os.path.normpath(self.model_id),
             "backend": self.backend,
             "height": self.height,
             "width": self.width,

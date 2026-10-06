@@ -332,7 +332,11 @@ from **FLUX.2 [klein] 4B** (`black-forest-labs/FLUX.2-klein-4B`, Apache-2.0)
 through diffusers' `Flux2KleinPipeline`: 1024×1024, 4 steps (the checkpoint is
 step-distilled), guidance 1.0 (ignored by the distilled checkpoint), bf16. The
 full run is ~60k sentences (CxC 49.5k, SICK 6.1k, STS3k 4.4k), generated once and
-reused by every image condition.
+reused by every image condition. `images.generator.model_id` takes the Hub id
+or a local copy of the pipeline folders. The config points at a copy on group
+storage (the download command is in the YAML and in
+[tsubame/README.md](tsubame/README.md)). Either way the id is part of the
+store's name, so it must stay the same for every config that reads the images.
 
 * *Seeds.* `seed_policy: shared` (default) starts every sentence from the same
   noise, so two images differ only through what the two texts change rather

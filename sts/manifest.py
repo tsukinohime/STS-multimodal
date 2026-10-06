@@ -87,12 +87,33 @@ def hardware_info(device: str) -> Dict[str, Any]:
     return info
 
 
+def _local_dir_revision(path: Path) -> Optional[str]:
+    """The Hub commit ``hf download --local-dir`` recorded for a local copy.
+
+    Each downloaded file has ``.cache/huggingface/download/<file>.metadata`` whose
+    first line is the commit it came from. A copy made any other way records
+    nothing (None); files from several commits are all listed.
+    """
+    commits = set()
+    for metadata in (path / ".cache" / "huggingface" / "download").rglob("*.metadata"):
+        try:
+            commits.add(metadata.read_text(encoding="utf-8").split("\n", 1)[0].strip())
+        except OSError:
+            continue
+    commits.discard("")
+    return ",".join(sorted(commits)) or None
+
+
 def resolve_model_revision(model_id: str) -> Optional[str]:
     """Best-effort HF commit sha, working offline.
 
-    Reads the local hub cache ref first so an offline compute node still gets a
-    pinned revision; only falls back to the Hub API when the cache is silent.
+    A local directory (weights copied to group storage, say) reports the commit
+    its ``hf download --local-dir`` recorded. A Hub id reads the local hub cache
+    ref first so an offline compute node still gets a pinned revision; only
+    falls back to the Hub API when the cache is silent.
     """
+    if Path(model_id).is_dir():
+        return _local_dir_revision(Path(model_id))
     try:
         from huggingface_hub import constants
 

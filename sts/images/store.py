@@ -239,8 +239,8 @@ class ImageStore:
             raise MissingImagesError(
                 f"{len(missing)} of {len(unique)} sentence(s) have no generated image{where} in "
                 f"{self.directory} (first: {missing[0]!r}). Run `python -m sts.cli imagine` with the "
-                "same config, datasets and --limit first; the generator settings must match too, "
-                "since they name the store directory."
+                "same config, datasets and --limit first; the generator settings (model_id "
+                "included) must match too, since they name the store directory."
             )
 
     def entry(self, text: str) -> Optional[dict]:
