@@ -1,10 +1,12 @@
-"""Vision-language judge: the LLM judge shown generated images instead of sentences.
+"""Vision-language judge: the LLM judge shown the images generated from the sentences.
 
 Scoring is exactly :class:`~sts.judge.scorer.LLMJudge`'s — one forward pass,
 the probability-weighted expectation over the answer digits, nothing generated
 — but the checkpoint is loaded as an image-text-to-text model with its
 processor, and every prompt carries two images: the ones the generator made
-from the pair's two sentences, read from the image store.
+from the pair's two sentences, read from the image store. The prompt set
+decides what else the prompt holds: nothing of the sentences (``image-v1``,
+condition D1) or the sentence pair itself (``text-image-v1``, D2).
 
 For Qwen3.5 the loading class matters. ``AutoModelForCausalLM`` resolves the
 checkpoint to ``Qwen3_5MoeForCausalLM``, the language model alone — that is how
@@ -33,7 +35,7 @@ _log = get_logger()
 class ImagePrompt:
     """A rendered image-pair prompt: chat text with image slots, and what fills them."""
 
-    text: str                  # the chat template's render; image placeholders, no sentences
+    text: str                  # the chat template's render, with image placeholders
     images: Tuple[str, ...]    # sentences whose generated images fill the slots, in order
 
 
@@ -48,6 +50,7 @@ class VLMJudge(LLMJudge):
         progress: bool = True,
     ) -> None:
         self.store = store
+        self.input = spec.input
         self.image_size = spec.image_size
         super().__init__(spec, device, dtype, batch_size, progress)
 
@@ -67,10 +70,10 @@ class VLMJudge(LLMJudge):
 
     # -- prompt plumbing ---------------------------------------------------
     def render(self, spec: PromptSpec, sentence_a: str, sentence_b: str) -> ImagePrompt:
-        if input_of(spec) != "image":
+        if input_of(spec) != self.input:
             raise ValueError(
-                f"{self.key} reads images, but prompt {spec.family}/{spec.version} is a text prompt; "
-                "use an image prompt set (e.g. image-v1)"
+                f"{self.key} takes {self.input} input, but prompt {spec.family}/{spec.version} is for "
+                f"{input_of(spec)} input; use image-v1 for image, text-image-v1 for text+image"
             )
         kwargs = {}
         if self.template_supports_thinking:
@@ -131,7 +134,7 @@ class VLMJudge(LLMJudge):
             **super().describe(),
             "backend": "hf-vlm",
             "model_class": type(self.model).__name__,
-            "input": "image",
+            "input": self.input,
             "image_size": self.image_size,
             "visual_tokens_per_image": visual_tokens(generated["width"], generated["height"], self.image_size),
             **self.store.describe(),

@@ -135,7 +135,7 @@ def command_run(args: argparse.Namespace) -> int:
 
 
 def command_imagine(args: argparse.Namespace) -> int:
-    """Generate one image per unique sentence of the configured datasets (stage 1 of D1)."""
+    """Generate one image per unique sentence of the configured datasets (stage 1 of D1, D2)."""
     from .images.pipeline import run_generation
 
     config = _config_from(args)

@@ -4,6 +4,7 @@
     python scripts/smoke_test.py --config configs/smoke.yaml                 # encoders
     python scripts/smoke_test.py --config configs/llm_judge_smoke.yaml --judge   # LLM judge
     python scripts/smoke_test.py --config configs/d1_smoke.yaml --d1          # D1: images
+    python scripts/smoke_test.py --config configs/d2_smoke.yaml --d2          # D2: text + images
 
 What it proves, in order:
 
@@ -23,7 +24,9 @@ What it proves, in order:
 With ``--d1`` each run is three stages — ``imagine``, then ``run`` and ``judge``
 on the generated images — and three more checks apply: every sentence has an
 image, a second ``imagine`` generates nothing, and no sentence text reaches an
-image-only prompt while both images do.
+image-only prompt while both images do. ``--d2`` runs ``imagine`` and ``judge``
+with the same image checks, except that a text + image prompt must carry both
+sentences, in order and ahead of the two images.
 
 Exit code is 0 only if everything passed.
 """
@@ -46,7 +49,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from sts.config import load_config  # noqa: E402
+from sts.config import load_config, reads_images  # noqa: E402
 from sts.diagnostics import (  # noqa: E402
     CheckResult,
     print_validation,
@@ -173,8 +176,8 @@ def judge_checks(output_dir: Path) -> List[CheckResult]:
     return results
 
 
-def d1_checks(config, output_dir: Path, warm_generated: Optional[int]) -> List[CheckResult]:
-    """Invariants of the image conditions: complete store, stable store, image-only prompts."""
+def image_checks(config, output_dir: Path, warm_generated: Optional[int]) -> List[CheckResult]:
+    """Invariants of the image conditions: complete store, stable store, what each prompt shows."""
     from sts.images.pipeline import load_datasets
     from sts.images.store import open_image_store, visual_tokens
     from sts.judge.prompts import PROMPT_SETS
@@ -194,30 +197,63 @@ def d1_checks(config, output_dir: Path, warm_generated: Optional[int]) -> List[C
         detail=f"second `imagine` generated {warm_generated} image(s)",
     ))
 
-    # No sentence text may reach an image-only prompt: by construction (the
+    def dumped(prompt_set: str):
+        """(file name, rendered prompt, sentence1, sentence2) of every prompt dumped for a set."""
+        for dump in sorted((output_dir / "prompts").glob(f"*__{prompt_set}__*.md")):
+            text = dump.read_text(encoding="utf-8")
+            pair_id = re.search(r"pair `([^`]+)`", text).group(1)
+            pairs = pd.read_csv(output_dir / "pairs" / f"{pair_id.rsplit('-', 1)[0]}.csv").set_index("pair_id")
+            rendered = text.split("exactly as tokenised", 1)[1]
+            yield dump.name, rendered, str(pairs.loc[pair_id, "sentence1"]), str(pairs.loc[pair_id, "sentence2"])
+
+    # No sentence text may reach an image-only prompt (D1): by construction (the
     # specs render without the sentences) and in every prompt actually dumped.
-    leaks = []
-    image_judges = [j for j in config.enabled_judges if j.input == "image"]
-    for prompt_set in {j.prompt_set for j in image_judges}:
-        for family, spec in PROMPT_SETS[prompt_set].items():
-            if "SENTINEL" in json.dumps(spec.messages("SENTINEL_A", "SENTINEL_B")):
-                leaks.append(f"{prompt_set}/{family} spec")
-    dumps = sorted((output_dir / "prompts").glob("*__image-*.md"))
-    for dump in dumps:
-        text = dump.read_text(encoding="utf-8")
-        pair_id = re.search(r"pair `([^`]+)`", text).group(1)
-        pairs = pd.read_csv(output_dir / "pairs" / f"{pair_id.rsplit('-', 1)[0]}.csv").set_index("pair_id")
-        rendered = text.split("exactly as tokenised", 1)[1]
-        if any(str(pairs.loc[pair_id, column]) in rendered for column in ("sentence1", "sentence2")):
-            leaks.append(dump.name)
-    results.append(CheckResult(
-        name="image_prompts_contain_no_sentence_text",
-        passed=not leaks and bool(dumps),
-        detail=f"{len(dumps)} dumped image prompt(s) and every image spec checked" if not leaks
-        else f"sentence text found in {leaks}",
-    ))
+    image_only = [j for j in config.enabled_judges if j.input == "image"]
+    if image_only:
+        leaks, n_dumps = [], 0
+        for prompt_set in {j.prompt_set for j in image_only}:
+            for family, spec in PROMPT_SETS[prompt_set].items():
+                if "SENTINEL" in json.dumps(spec.messages("SENTINEL_A", "SENTINEL_B")):
+                    leaks.append(f"{prompt_set}/{family} spec")
+            for name, rendered, sentence1, sentence2 in dumped(prompt_set):
+                n_dumps += 1
+                if sentence1 in rendered or sentence2 in rendered:
+                    leaks.append(name)
+        results.append(CheckResult(
+            name="image_prompts_contain_no_sentence_text",
+            passed=not leaks and n_dumps > 0,
+            detail=f"{n_dumps} dumped image prompt(s) and every image spec checked" if not leaks
+            else f"sentence text found in {leaks}",
+        ))
+
+    # A text + image prompt (D2) carries both sentences, in order, ahead of the
+    # two images: in every spec and in every prompt actually dumped.
+    text_image = [j for j in config.enabled_judges if j.input == "text+image"]
+    if text_image:
+        problems, n_dumps = [], 0
+        for prompt_set in {j.prompt_set for j in text_image}:
+            for family, spec in PROMPT_SETS[prompt_set].items():
+                content = spec.messages("SENTINEL_A", "SENTINEL_B")[-1]["content"]
+                slots = [i for i, part in enumerate(content) if part["type"] == "image"]
+                lead = "".join(part.get("text", "") for part in content[: slots[0]]) if slots else ""
+                if len(slots) != 2 or not 0 <= lead.find("SENTINEL_A") < lead.find("SENTINEL_B"):
+                    problems.append(f"{prompt_set}/{family} spec")
+            for name, rendered, sentence1, sentence2 in dumped(prompt_set):
+                n_dumps += 1
+                first_image = rendered.find("<|vision_start|>")
+                at_1 = rendered.find(sentence1)
+                at_2 = rendered.find(sentence2, at_1 + len(sentence1)) if at_1 >= 0 else -1
+                if not (at_1 >= 0 and at_2 >= 0 and at_2 + len(sentence2) <= first_image):
+                    problems.append(name)
+        results.append(CheckResult(
+            name="text_image_prompts_carry_both_sentences_before_the_images",
+            passed=not problems and n_dumps > 0,
+            detail=f"{n_dumps} dumped text + image prompt(s) and every spec checked" if not problems
+            else f"sentences missing, out of order or after the images in {problems}",
+        ))
 
     # Both images reached the judge: each prompt is at least two images long.
+    image_judges = [j for j in config.enabled_judges if reads_images(j.input)]
     short = []
     for judge in image_judges:
         per_image = visual_tokens(store.fingerprint["width"], store.fingerprint["height"], judge.image_size)
@@ -248,10 +284,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="smoke-test the LLM-as-judge pipeline (`sts.cli judge`) instead of the encoder one")
     parser.add_argument("--d1", action="store_true",
                         help="smoke-test condition D1: `imagine`, then `run` and `judge` on the generated images")
+    parser.add_argument("--d2", action="store_true",
+                        help="smoke-test condition D2: `imagine`, then `judge` on the sentences and their images")
     args = parser.parse_args(argv)
-    if args.d1 and args.judge:
-        parser.error("--d1 already covers the judge; pass one of --judge / --d1")
-    stages = ["imagine", "run", "judge"] if args.d1 else ["judge" if args.judge else "run"]
+    if args.judge + args.d1 + args.d2 > 1:
+        parser.error("--d1 and --d2 already cover the judge; pass one of --judge / --d1 / --d2")
+    if args.d1:
+        stages = ["imagine", "run", "judge"]
+    elif args.d2:
+        stages = ["imagine", "judge"]
+    else:
+        stages = ["judge" if args.judge else "run"]
+    judged = args.judge or args.d2
 
     config = load_config(args.config, overrides={
         "models": args.models, "device": args.device, "data_root": args.data_root,
@@ -269,7 +313,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("=" * 78)
     print(f"SMOKE TEST  |  config={args.config.name}  limit={config.limit} pairs/dataset")
     keys = [m.key for m in config.enabled_models] + [j.key for j in config.enabled_judges]
-    print(f"            |  {'judges' if args.judge else 'models'}={keys}")
+    print(f"            |  {'judges' if judged else 'models'}={keys}")
     print(f"            |  datasets={config.datasets}")
     print("=" * 78)
 
@@ -282,7 +326,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             for directory in config.runtime.cache_dir.glob(f"{key}__*"):
                 shutil.rmtree(directory, ignore_errors=True)
         generator = config.images.generator
-        if args.d1 and generator is not None and generator.backend == "render-text":
+        if (args.d1 or args.d2) and generator is not None and generator.backend == "render-text":
             # Only the model-free stand-in's images are cheap enough to throw
             # away; a real generator's store is shared with the full run.
             from sts.images.store import open_image_store
@@ -312,7 +356,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if code != 0:
         print(f"\nFAIL: the cold run exited with code {code}")
         return 1
-    cold_hits, cold_misses = stage_cache_totals(output_dir, args.d1, args.judge)
+    cold_hits, cold_misses = stage_cache_totals(output_dir, args.d1, judged)
     cold_predictions = read_predictions(output_dir)
     extra_checks.append(CheckResult(
         name="cold_run_completes",
@@ -328,7 +372,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\nFAIL: the warm run exited with code {code}")
         return 1
     warm_generated = generated_now()
-    warm_hits, warm_misses = stage_cache_totals(output_dir, args.d1, args.judge)
+    warm_hits, warm_misses = stage_cache_totals(output_dir, args.d1, judged)
     extra_checks.append(CheckResult(
         name="cache_reused_after_restart",
         passed=warm_misses == 0 and warm_hits > 0,
@@ -367,11 +411,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("Running correctness checks...")
     # The encoder checks (cos(x,x)=1, order invariance) are properties of an
     # embedding space; a judge is checked through its predictions instead.
-    checks = run_validation(config, encoder_checks=not args.judge, sample=16)
-    if args.judge or args.d1:
+    checks = run_validation(config, encoder_checks=not judged, sample=16)
+    if judged or args.d1:
         checks.extend(judge_checks(output_dir))
-    if args.d1:
-        checks.extend(d1_checks(config, output_dir, warm_generated))
+    if args.d1 or args.d2:
+        checks.extend(image_checks(config, output_dir, warm_generated))
 
     # ---- 5. single-command reproduction ------------------------------------
     reproduce = " && ".join(f"python -m sts.cli {stage} --config {args.config}" for stage in stages)

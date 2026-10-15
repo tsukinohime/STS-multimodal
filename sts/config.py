@@ -125,9 +125,16 @@ class RuntimeConfig:
         self.cache_dir = Path(self.cache_dir)
 
 
-#: What a model or judge is shown for each sentence: the sentence itself, or
-#: the image the configured generator made from it (condition D1).
-INPUT_KINDS = ("text", "image")
+#: What a model or judge is shown for each sentence: the sentence itself, the
+#: image the configured generator made from it (condition D1), or both (D2).
+INPUT_KINDS = ("text", "image", "text+image")
+#: An encoder embeds one modality per sentence; only a judge takes both.
+MODEL_INPUT_KINDS = ("text", "image")
+
+
+def reads_images(input_kind: str) -> bool:
+    """True when the input includes the generated images."""
+    return input_kind in ("image", "text+image")
 
 
 def _input_fingerprint(input_kind: str, image_size: Optional[int]) -> Dict[str, Any]:
@@ -205,7 +212,7 @@ class JudgeSpec:
     max_prompt_tokens: int = 1024       # flagged, never truncated
     dtype: Optional[str] = None
     trust_remote_code: bool = False
-    input: str = "text"                 # text | image: the judge sees the generated images instead
+    input: str = "text"                 # text | image (the generated images instead) | text+image (both)
     image_size: Optional[int] = None    # image input: longer side in pixels; None = as generated
     enabled: bool = True
     notes: str = ""
@@ -336,7 +343,7 @@ class ExperimentConfig:
     @property
     def uses_images(self) -> bool:
         """True when an enabled model or judge reads generated images."""
-        return any(s.input == "image" for s in [*self.enabled_models, *self.enabled_judges])
+        return any(reads_images(s.input) for s in [*self.enabled_models, *self.enabled_judges])
 
     def judge_by_key(self, key: str) -> JudgeSpec:
         for judge in self.judges:
@@ -425,9 +432,9 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
     clash = {m.key for m in models} & {j.key for j in judges}
     if clash:
         raise ValueError(f"{path}: keys used by both a model and a judge: {sorted(clash)}")
-    for spec in [*models, *judges]:
-        if spec.input not in INPUT_KINDS:
-            raise ValueError(f"{spec.key!r}: input must be one of {INPUT_KINDS}, got {spec.input!r}")
+    for spec, kinds in [*((m, MODEL_INPUT_KINDS) for m in models), *((j, INPUT_KINDS) for j in judges)]:
+        if spec.input not in kinds:
+            raise ValueError(f"{spec.key!r}: input must be one of {kinds}, got {spec.input!r}")
 
     generator_raw = images_raw.pop("generator", None)
     generator = None
@@ -442,7 +449,7 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
     if "store_dir" in images_raw:
         images_raw["store_dir"] = _expand(images_raw["store_dir"], base)
     images = ImagesConfig(**images_raw, generator=generator)
-    needs_images = [s.key for s in [*models, *judges] if s.input == "image"]
+    needs_images = [s.key for s in [*models, *judges] if reads_images(s.input)]
     if needs_images and generator is None:
         raise ValueError(f"{path}: {needs_images} read generated images, but images.generator is not set")
 

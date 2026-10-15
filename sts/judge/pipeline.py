@@ -17,11 +17,13 @@ Per (judge, dataset) the run records, beyond the correlations:
 * an order-symmetry diagnostic on a sample: the same pairs scored with the two
   sentences swapped, reported as mean |Δ| and the Spearman between orders.
 
-A judge with ``input: image`` (condition D1) is a :class:`~sts.judge.vlm.VLMJudge`
-shown the two images generated from the sentences, with an image prompt set.
-The cache key stays the ordered sentence pair — each sentence names its image —
-and the image store's hash joins the cache fingerprint. The order-symmetry
-check then swaps the two images.
+A judge with ``input: image`` (condition D1) or ``input: text+image`` (D2) is a
+:class:`~sts.judge.vlm.VLMJudge` shown the two images generated from the
+sentences — alone, or after the sentence pair — with the matching prompt set
+(``image-v1`` / ``text-image-v1``). The cache key stays the ordered sentence
+pair — each sentence names its image — and the image store's hash joins the
+cache fingerprint. The order-symmetry check then swaps the sentences and their
+images together.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ import numpy as np
 import pandas as pd
 
 from ..cache import EmbeddingCache
-from ..config import ExperimentConfig, JudgeSpec, get_logger, resolve_device, resolve_dtype
+from ..config import ExperimentConfig, JudgeSpec, get_logger, reads_images, resolve_device, resolve_dtype
 from ..data import STSDataset, load_dataset
 from ..images.store import ImageStore, open_image_store
 from ..manifest import Manifest
@@ -64,11 +66,11 @@ def build_judge(
     progress: bool,
     store: Optional[ImageStore] = None,
 ) -> LLMJudge:
-    """A text judge, or for ``input: image`` a vision-language judge reading ``store``."""
-    if spec.input != "image":
+    """A text judge, or for image input (D1, D2) a vision-language judge reading ``store``."""
+    if not reads_images(spec.input):
         return LLMJudge(spec, device, dtype, batch_size, progress)
     if store is None:
-        raise ValueError(f"{spec.key}: input: image needs the image store of the config's generator")
+        raise ValueError(f"{spec.key}: input: {spec.input} needs the image store of the config's generator")
     from .vlm import VLMJudge
 
     return VLMJudge(spec, device, dtype, batch_size, store, progress)
@@ -184,10 +186,10 @@ def build_predictions(
     if expected_rev is not None:
         columns["expected_score_fwd"] = expected_fwd
         columns["expected_score_rev"] = expected_rev
-    if judge_spec.input == "image" and store is not None:
-        # The pair was judged from these images; prompt_tokens include their image tokens.
+    if reads_images(judge_spec.input) and store is not None:
+        # The pair was judged with these images; prompt_tokens include their image tokens.
         columns.update({
-            "input": "image",
+            "input": judge_spec.input,
             "image_size": judge_spec.image_size if judge_spec.image_size else "native",
             "image_store": store.fingerprint_hash,
             "generator": store.generator_key,
@@ -287,10 +289,15 @@ def dump_prompt(
     rendered = judge.render(spec, pair.sentence1, pair.sentence2)
     images = getattr(rendered, "images", None)
     rendered = getattr(rendered, "text", rendered)
-    image_lines = [
-        f"- input: images generated from the two sentences (store `{judge.store.directory.name}`); "
-        "the sentences themselves are not in the prompt",
-    ] if images else []
+    image_lines = []
+    if images:
+        store = f"(store `{judge.store.directory.name}`)"
+        image_lines = [
+            f"- input: the two sentences, then the images generated from them {store}"
+            if input_of(spec) == "text+image" else
+            f"- input: images generated from the two sentences {store}; "
+            "the sentences themselves are not in the prompt",
+        ]
     body = "\n".join([
         f"# Prompt {spec.family} {spec.version}",
         "",
@@ -351,7 +358,7 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
             dataset.to_dataframe().to_csv(pair_path, index=False)
 
     store: Optional[ImageStore] = None
-    if any(j.input == "image" for j in config.enabled_judges):
+    if any(reads_images(j.input) for j in config.enabled_judges):
         store = open_image_store(config)
         _log.info("Image input from %s (%d images)", store.directory, len(store))
 
@@ -374,7 +381,7 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
                     _log.info("[%s | %s] resume: reusing %s", judge_spec.key, name, output_path)
                     predictions = pd.read_csv(output_path)
                 else:
-                    if judge_spec.input == "image":
+                    if reads_images(judge_spec.input):
                         # Fail before loading ~70 GB of weights, with the command that fixes it.
                         store.require(dataset.unique_texts(), purpose=f"{judge_spec.key} on {name}")
                     if judge is None:
@@ -398,7 +405,7 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
                             "prompt_hash": prompt_hash,
                             "scale": list(spec.scale),
                         }
-                        if judge_spec.input == "image":
+                        if reads_images(judge_spec.input):
                             fingerprint["images"] = store.fingerprint_hash
                         caches[family] = EmbeddingCache(
                             cache_dir=config.runtime.cache_dir,

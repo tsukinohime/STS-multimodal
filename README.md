@@ -7,8 +7,9 @@ task?**
 
 This repository holds **Milestone 1 — the text-only baselines** that every
 multimodal result is compared against (embedding cosine, and an LLM judge), and
-the first image condition, **D1: generated image only** (see
-[below](#condition-d1-generated-image-only)).
+the image conditions **D1: generated image only** (see
+[below](#condition-d1-generated-image-only)) and **D2: sentence pair + generated
+images** ([below](#condition-d2-sentence-pair--generated-images)).
 
 ## What Milestone 1 does
 
@@ -420,6 +421,54 @@ pairs each system ranks furthest from gold, per label, next to every other
 system's rank for the same pair. `--label-column entailment_AB|entailment_BA`
 uses the directional labels instead.
 
+## Condition D2: sentence pair + generated images
+
+The judge sees the sentence pair and, after it, the two images generated from
+the two sentences, and rates the pair from both.
+
+```bash
+python -m sts.cli imagine --config configs/d2_text_image.yaml   # 1. images (nothing new once D1 has run)
+python -m sts.cli judge   --config configs/d2_text_image.yaml   # 2. VLM judge on the pair + its images
+python -m sts.cli report  --config configs/d2_text_image.yaml
+python scripts/smoke_test.py --config configs/d2_smoke.yaml --d2   # laptop smoke test, stand-in models
+```
+
+**Images.** The `images` block of [configs/d2_text_image.yaml](configs/d2_text_image.yaml)
+is D1's, setting for setting, so D2 reads D1's store and its `imagine`
+generates nothing once D1's has covered the datasets. Keep the two blocks
+identical; a difference starts a second store.
+
+**Judge.** D1's judge (Qwen3.5-35B-A3B with its vision encoder, images at
+512 px, thinking off, digit expectation), with `input: text+image` and prompt
+set `text-image-v1` ([sts/judge/prompts.py](sts/judge/prompts.py)): the v1
+prompt verbatim, sentence pair block included, followed by D1's image block,
+with one fixed sentence after the instruction:
+
+> Each sentence was given to a text-to-image model, and the image it generated
+> is shown after the sentence pair, in the same order as the sentences. Base
+> your rating on both the sentences and the images.
+
+It names both sources and weighs neither against the other. D2 is thus B1 plus
+the images and D1 plus the sentences. The order-symmetry check swaps the
+sentences and their images together. Prediction rows carry
+`input: text+image`. A prompt is D1's plus the sentence pair: 21–58 tokens more
+per pair on the smoke sample (median 30–36 per dataset). No embedding model in
+this round.
+
+**Caches** live in `.cache/d2/`; their fingerprints carry the input kind, the
+prompt hash and the image-store hash, so they never mix with B1's or D1's.
+
+**Against B1 and D1** (keys `d2-…`, `d1-…` and the text judge's):
+
+```bash
+python -m sts.cli breakdown --config configs/d2_text_image.yaml \
+    --datasets sick-all sick-test cxc-val cxc-test \
+    --baseline outputs/llm_judge/full --baseline outputs/d1_image_only/full
+```
+
+On TSUBAME, `tsubame/job_d2.sh` runs each stage as its own job; see
+[tsubame/README.md](tsubame/README.md#condition-d2-sentence-pair--generated-images).
+
 ## Outputs
 
 Written to `experiment.output_dir` (default `outputs/text_only/`):
@@ -544,9 +593,9 @@ sts/
   diagnostics.py   validation checks + cross-model alignment probe
   breakdown.py     results by SICK NLI label / CxC sampling_method, from predictions on disk
   cli.py           command-line entry point
-  judge/           LLM-as-judge: prompts.py (specs + hashes; text v1 and image-v1),
-                   scorer.py (next-token expectation), vlm.py (the same, shown
-                   two generated images), pipeline.py (orchestration)
+  judge/           LLM-as-judge: prompts.py (specs + hashes; text v1, image-v1,
+                   text-image-v1), scorer.py (next-token expectation), vlm.py
+                   (the same, shown two generated images), pipeline.py (orchestration)
   images/          generated images: store.py (sharded tar store), generators.py
                    (FLUX.2 [klein], render-text stand-in), pipeline.py (`imagine`)
   models/images.py image input for an encoder: sentences -> their images' embeddings
@@ -557,9 +606,11 @@ configs/
   llm_judge_smoke.yaml   its 32-pair smoke test (0.5B stand-in judge)
   d1_image_only.yaml     condition D1: FLUX.2 [klein] images, jina-v5-omni + Qwen3.5 judge
   d1_smoke.yaml          its 32-pair smoke test (render-text images, Qwen3.5-0.8B judge)
+  d2_text_image.yaml     condition D2: sentence pair + D1's images, Qwen3.5 judge
+  d2_smoke.yaml          its 32-pair smoke test (render-text images, Qwen3.5-0.8B judge)
 scripts/
-  smoke_test.py    run twice + validate everything (--judge, --d1)
+  smoke_test.py    run twice + validate everything (--judge, --d1, --d2)
 tsubame/
   README.md  env.sh.example  activate_env.sh  prefetch_models.sh
-  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh  job_d1.sh
+  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh  job_d1.sh  job_d2.sh
 ```

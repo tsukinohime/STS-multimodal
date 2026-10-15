@@ -289,6 +289,39 @@ Outputs: `outputs/d1_image_only/{smoke_N,full}/`, laid out like the text
 runs (predictions, metrics, summary, prompts), plus `imagine__<jobid>.json`,
 which records the generator, its settings, the store and the throughput.
 
+## Condition D2: sentence pair + generated images
+
+`job_d2.sh STAGE [smoke [N] | full]` runs one stage of
+`configs/d2_text_image.yaml` per job (details: main README, "Condition D2"). The
+judge is D1's, shown the sentence pair and then its two images:
+
+| stage | what it does | resources |
+|-------|--------------|-----------|
+| `imagine` | generates the images still missing from the store; D2 reads D1's store, so after D1's `imagine` there are none | GPU |
+| `judge` | Qwen3.5-35B-A3B shown the sentence pair and its two images | a whole GPU (`gpu_1` / `node_q`) |
+| `report` | rebuilds the summary from the predictions | CPU only |
+
+Pass the **same `STS_IMAGE_DIR` as the D1 jobs**: D2 has no images of its own.
+Its judge fails before loading the weights, with `MissingImagesError`, if a
+sentence has no image there. Nothing new to download.
+
+```bash
+py="$(command -v python)"; img=/gs/fs/tga-kiban-arase/zhu/sts/images   # D1's store
+qsub -g <group> -l gpu_1=1 -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d2.sh judge smoke 32
+# after checking the smoke run:
+qsub -g <group> -l gpu_1=1 -l h_rt=<HH:MM:SS> -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d2.sh judge full
+qsub -g <group> -l <cpu resource>=1 -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_d2.sh report full
+```
+
+The smoke's images are D1 smoke's (same `--limit`, same seed), so it runs
+without an `imagine` stage. The full judge needs D1's full `imagine` to have
+finished. Size `h_rt` as for D1's judge: twice the smoke `pairs_per_second` (the
+smoke re-scores every pair in swapped order), ~101k forward passes in total.
+`STS_D2_DATASETS` splits the judge over several GPUs exactly like
+`STS_D1_DATASETS`; `bash tsubame/job_d2.sh --help` lists every variable.
+
+Outputs: `outputs/d2_text_image/{smoke_N,full}/`, laid out like the D1 runs.
+
 ## Run (embedding)
 
 ```bash

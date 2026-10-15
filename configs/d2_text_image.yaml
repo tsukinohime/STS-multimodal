@@ -1,0 +1,126 @@
+# =============================================================================
+# Condition D2: sentence pair + generated images.
+#
+# The VLM judge is shown the sentence pair, then the two images the
+# text-to-image model generated from the two sentences, and rates the pair from
+# both. The prompt is the text judge's (B1) verbatim plus the D1 image block and
+# one sentence saying where the images come from; it gives no instruction on how
+# to weigh the sentences against the images. So D2 - B1 is what the images add
+# to the sentences, and D2 - D1 what the sentences add to the images.
+#
+# Stages (each resumable; TSUBAME: tsubame/job_d2.sh):
+#   python -m sts.cli imagine --config configs/d2_text_image.yaml  # 1. sentences -> images
+#   python -m sts.cli judge   --config configs/d2_text_image.yaml  # 2. VLM judge on text + images
+#   python -m sts.cli report  --config configs/d2_text_image.yaml
+#
+# The images block is configs/d1_image_only.yaml's, setting for setting, so
+# both conditions read one image store: once D1's imagine has covered the
+# datasets, D2's finds every image already stored and generates nothing.
+# Change a generator setting in one config only and the two stop sharing.
+#
+# Datasets, splits, categories, seed, metrics, macro average and the
+# prediction schema are those of the text baselines and D1, so
+#   python -m sts.cli breakdown --config configs/d2_text_image.yaml \
+#       --baseline outputs/llm_judge/full --baseline outputs/d1_image_only/full
+# lines D2 up against B1 and D1 pair by pair.
+# =============================================================================
+
+experiment:
+  name: d2_text_image
+  condition: D2
+  output_dir: outputs/d2_text_image
+  seed: 42
+  resume: true
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: auto
+  dtype: auto               # bfloat16 on cuda
+  batch_size: 16
+  max_length: 512           # text-encoder setting; unused by the judge
+  # Judgment cache. Its fingerprint carries the input kind (text+image), the
+  # prompt hash and the image-store hash, so it never mixes with B1's or D1's.
+  cache_dir: .cache/d2
+  use_cache: true
+  flush_every: 512          # pairs between cache flushes
+  progress: true
+  seed: 42
+
+# -----------------------------------------------------------------------------
+# The images: identical to configs/d1_image_only.yaml (see the comments there).
+# -----------------------------------------------------------------------------
+images:
+  store_dir: .cache/images    # on TSUBAME pass the group-storage store D1 used (STS_IMAGE_DIR)
+  flush_every: 512
+  preview_pairs: 4
+  generator:
+    key: flux2-klein-4b
+    model_id: /gs/fs/tga-kiban-arase/zhu/models/FLUX.2-klein-4B
+    backend: flux2-klein
+    height: 1024
+    width: 1024
+    num_inference_steps: 4
+    guidance_scale: 1.0
+    max_sequence_length: 512
+    seed: 0
+    seed_policy: shared
+    dtype: bfloat16
+    batch_size: 8
+    image_format: jpeg
+    jpeg_quality: 95
+
+# -----------------------------------------------------------------------------
+# No embedding model in this round: D2 is the judge condition.
+# -----------------------------------------------------------------------------
+models: []
+
+# -----------------------------------------------------------------------------
+# The judge: the same checkpoint and settings as D1's, shown text + images.
+#
+# Prompt set text-image-v1 = the v1 prompt (system prompt, instruction,
+# anchors, sentence pair block, answer line, all verbatim), with the note and
+# the two images inserted; thinking off; digit expectation from one forward
+# pass. image_size 512 as in D1, so D1 and D2 see the same pixels. A prompt is
+# D1's 736-846 tokens plus the sentence pair, 21-58 more (measured on the smoke
+# sample).
+# -----------------------------------------------------------------------------
+judges:
+  - key: d2-qwen3.5-35b-a3b
+    model_id: /gs/fs/tga-kiban-arase/zhu/models/Qwen3.5-35B-A3B
+    backend: hf
+    prompt_set: text-image-v1
+    input: text+image
+    image_size: 512
+    enable_thinking: false        # hard requirement: no CoT
+    symmetrize: false
+    symmetry_check_sample: 256    # pairs re-scored with sentences and images swapped, per dataset
+    min_valid_mass: 0.05
+    batch_size: 8                 # pairs (16 images) per forward pass
+    max_prompt_tokens: 4096       # flagged if exceeded; never truncated
+    trust_remote_code: false
+    enabled: true
+    notes: "D2 judge: the sentence pair plus its two generated images; no weighting instruction."
+
+metrics:
+  bootstrap: 0
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  macro_average_over:
+    - cxc-val
+    - cxc-test
+    - sick-test
+    - sts3k

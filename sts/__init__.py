@@ -9,7 +9,8 @@ pair -> frozen pretrained encoder -> L2-normalised embeddings -> cosine
 similarity (or a frozen LLM judge) -> Spearman (headline) and Pearson
 correlation against human gold scores. On top of them, condition D1 scores the
 images a text-to-image model generates from the two sentences instead of the
-sentences. Nothing is trained, fine-tuned, regressed or calibrated, and no
+sentences, and condition D2 has the judge rate the sentences together with
+those images. Nothing is trained, fine-tuned, regressed or calibrated, and no
 decision is made on a test split.
 
 Modules

@@ -26,6 +26,13 @@ so D1 differs from the text judge (B1) only in what represents the pair. The
 rating target stays the meaning of the *sentences* — the construct the gold
 scores measure — judged through their images. No sentence text reaches the
 prompt.
+
+**Text + image variants** (``text-image-v1``, condition D2) keep the v1 prompt
+whole, sentence pair block included, and add the D1 image block after it,
+preceded by one fixed sentence saying where the images come from and that the
+rating rests on both. D2 is therefore B1 plus the images, and D1 plus the
+sentences. The note asks for both sources without weighting one against the
+other.
 """
 
 from __future__ import annotations
@@ -212,20 +219,21 @@ class ImagePairPromptSpec(PromptSpec):
     input: str = "image"
     modality_note: str = _IMAGE_NOTE
 
-    def _lead(self) -> str:
+    def _lead(self, sentence_a: str, sentence_b: str) -> str:
+        """Everything before the first image.
+
+        The sentences are deliberately unused: they never reach an image-only prompt.
+        """
         return "\n\n".join([self.instruction, self.modality_note, "Image pair:"])
 
     def render_user(self, sentence_a: str, sentence_b: str) -> str:
-        """The user turn as text, images shown as placeholders (for the hash and dumps).
-
-        The sentences are deliberately unused: they never reach the prompt.
-        """
-        return f"{self._lead()}\n- {{image_a}}\n- {{image_b}}\n\n{_answer_line(self.scale)}"
+        """The user turn as text, images shown as placeholders (for the hash and dumps)."""
+        return f"{self._lead(sentence_a, sentence_b)}\n- {{image_a}}\n- {{image_b}}\n\n{_answer_line(self.scale)}"
 
     def messages(self, sentence_a: str, sentence_b: str) -> list:
         """Chat messages with two image slots, filled in order with the images of a then b."""
         content = [
-            {"type": "text", "text": f"{self._lead()}\n- "},
+            {"type": "text", "text": f"{self._lead(sentence_a, sentence_b)}\n- "},
             {"type": "image"},
             {"type": "text", "text": "\n- "},
             {"type": "image"},
@@ -252,6 +260,47 @@ def _image_variant(spec: PromptSpec, version: str) -> ImagePairPromptSpec:
     )
 
 
+# --------------------------------------------------------------------------- #
+# text-image-v1 — condition D2: the v1 prompts with the two images added
+# --------------------------------------------------------------------------- #
+_TEXT_IMAGE_NOTE = (
+    "Each sentence was given to a text-to-image model, and the image it generated is shown after "
+    "the sentence pair, in the same order as the sentences. Base your rating on both the sentences "
+    "and the images."
+)
+
+
+@dataclass(frozen=True)
+class TextImagePairPromptSpec(ImagePairPromptSpec):
+    """A text spec that shows the sentence pair and then the two images generated from it."""
+
+    input: str = "text+image"
+    modality_note: str = _TEXT_IMAGE_NOTE
+
+    def _lead(self, sentence_a: str, sentence_b: str) -> str:
+        return "\n\n".join([
+            self.instruction,
+            self.modality_note,
+            _PAIR_BLOCK.format(sentence_a=sentence_a, sentence_b=sentence_b),
+            "Image pair:",
+        ])
+
+
+def _text_image_variant(spec: PromptSpec, version: str) -> TextImagePairPromptSpec:
+    return TextImagePairPromptSpec(
+        family=spec.family,
+        version=version,
+        scale=spec.scale,
+        system=spec.system,
+        instruction=spec.instruction,
+        source=spec.source + (
+            " Text + image variant (D2): this instruction and the sentence pair block verbatim; the two "
+            "images generated from the sentences follow the pair."
+        ),
+        notes=spec.notes,
+    )
+
+
 PROMPT_SETS: Dict[str, Dict[str, PromptSpec]] = {
     "v1": {"cxc": _CXC_V1, "sick": _SICK_V1, "sts3k": _STS3K_V1},
     "image-v1": {
@@ -259,11 +308,16 @@ PROMPT_SETS: Dict[str, Dict[str, PromptSpec]] = {
         "sick": _image_variant(_SICK_V1, "image-v1"),
         "sts3k": _image_variant(_STS3K_V1, "image-v1"),
     },
+    "text-image-v1": {
+        "cxc": _text_image_variant(_CXC_V1, "text-image-v1"),
+        "sick": _text_image_variant(_SICK_V1, "text-image-v1"),
+        "sts3k": _text_image_variant(_STS3K_V1, "text-image-v1"),
+    },
 }
 
 
 def input_of(spec: PromptSpec) -> str:
-    """``image`` for an image-pair spec, ``text`` otherwise."""
+    """What a spec shows for each sentence: ``text``, ``image`` or ``text+image``."""
     return getattr(spec, "input", "text")
 
 

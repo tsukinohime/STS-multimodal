@@ -122,6 +122,18 @@ CONDITION_TEXT = {
         "survives the text -> image -> model round trip. Nothing is trained, calibrated or "
         "tuned on any split. Generator and image settings are in the Models table.",
     ),
+    "D2": (
+        "D2: sentence pair + generated images",
+        "Each sentence is given to a frozen text-to-image model, and a vision-language judge is "
+        "shown the sentence pair followed by the two generated images. The prompt is the text "
+        "judge's verbatim (dataset rating guidelines and sentence pair) with the two images "
+        "added after the pair and one sentence saying where they come from; it asks for a "
+        "rating based on both, without weighting either. The prediction is the expectation over "
+        "the answer digits, as for the text judge. The gap to the text judge (B1) measures what "
+        "the images add to the sentences; the gap to D1 what the sentences add to the images. "
+        "Nothing is trained, calibrated or tuned on any split. Generator and image settings are "
+        "in the Models table.",
+    ),
 }
 
 
@@ -300,8 +312,9 @@ def build_markdown_summary(
         ))
 
     if config.images.generator is not None:
-        commands = [f"python -m sts.cli {step} --config {config.source_path}"
-                    for step in ("imagine", "run", "judge", "report")]
+        steps = ["imagine", *(["run"] if config.enabled_models else []),
+                 *(["judge"] if config.enabled_judges else []), "report"]
+        commands = [f"python -m sts.cli {step} --config {config.source_path}" for step in steps]
     else:
         commands = [f"python -m sts.cli {'judge' if method == 'judge' else 'run'} --config {config.source_path}"]
     lines += ["", "## Reproduce", "", "```bash", *commands, "```", ""]
