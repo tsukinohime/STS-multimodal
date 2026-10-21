@@ -75,7 +75,7 @@ def find_systems(
     baselines: Sequence[Path] = (),
     baseline_models: Optional[Sequence[str]] = None,
 ) -> List[System]:
-    """The config's enabled judges/models, then every model under each baseline dir."""
+    """The config's enabled judges/models/fused systems, then every model under each baseline dir."""
     found: Dict[str, System] = {}
 
     def add(key: str, path: Path) -> None:
@@ -84,7 +84,7 @@ def find_systems(
         column = prediction_column_of(pd.read_csv(path, nrows=1))
         found[key] = System(key=key, path=path, column=column)
 
-    for key in [j.key for j in config.enabled_judges] + [m.key for m in config.enabled_models]:
+    for key in [j.key for j in config.enabled_judges] + [m.key for m in config.enabled_models] + config.fusion_keys:
         path = config.output_dir / "predictions" / key / f"{dataset_name}.csv"
         if path.exists():
             add(key, path)

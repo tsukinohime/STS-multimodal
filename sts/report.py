@@ -134,6 +134,18 @@ CONDITION_TEXT = {
         "Nothing is trained, calibrated or tuned on any split. Generator and image settings are "
         "in the Models table.",
     ),
+    "LF": (
+        "LF: late fusion of text and image scores",
+        "Per pair, fused = alpha * text + (1 - alpha) * image, from the per-pair predictions of "
+        "finished runs (a text system and an image system, e.g. A0 and D1), each source normalised "
+        "within the dataset without labels; no model is run. `-text` and `-image` are the two "
+        "sources alone on the same pairs (alpha 1 and 0); `-a<alpha>` uses an alpha fixed in "
+        "advance; `-dev` an alpha chosen on development pairs only (CxC val, SICK train + trial) "
+        "and applied to disjoint evaluation pairs, so no test split's gold scores enter a choice. "
+        "The macro average covers the evaluation datasets only. fusion_comparison.md has each "
+        "fused system's gain over text-only with a paired-bootstrap CI; alpha_sweep.md the whole "
+        "curve from image-only to text-only.",
+    ),
 }
 
 
@@ -250,7 +262,7 @@ def build_markdown_summary(
             [
                 str(r["model"]), str(r["dataset"]), str(r["n_pairs"]), str(r["n_unique_texts"]),
                 f"{r['runtime_seconds']:.1f}", str(r.get("pairs_per_second", "—")),
-                f"{(r.get('cache') or {}).get('hit_rate', 0):.2f}",
+                f"{r['cache']['hit_rate']:.2f}" if r.get("cache") else "—",
                 str(r.get("n_truncated_pairs", 0)),
             ]
             for r in runs
@@ -311,7 +323,9 @@ def build_markdown_summary(
             ],
         ))
 
-    if config.images.generator is not None:
+    if config.fusion is not None:
+        commands = [f"python -m sts.cli fuse --config {config.source_path}"]
+    elif config.images.generator is not None:
         steps = ["imagine", *(["run"] if config.enabled_models else []),
                  *(["judge"] if config.enabled_judges else []), "report"]
         commands = [f"python -m sts.cli {step} --config {config.source_path}" for step in steps]

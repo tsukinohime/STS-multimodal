@@ -469,6 +469,56 @@ python -m sts.cli breakdown --config configs/d2_text_image.yaml \
 On TSUBAME, `tsubame/job_d2.sh` runs each stage as its own job; see
 [tsubame/README.md](tsubame/README.md#condition-d2-sentence-pair--generated-images).
 
+## Late fusion (LF): weighing text against images
+
+Per pair, `fused = α · norm(text score) + (1 − α) · norm(image score)`, read from
+the per-pair predictions finished runs already wrote. No model is loaded; the
+whole step is CPU only and takes under a minute on the full datasets.
+
+```bash
+python -m sts.cli fuse --config configs/late_fusion.yaml        # needs A0, B1 and D1 finished
+python -m sts.cli fuse --config configs/late_fusion_smoke.yaml  # laptop: the four smoke runs' outputs
+```
+
+[configs/late_fusion.yaml](configs/late_fusion.yaml) fuses two pairs, each one
+model looking at the text and at the images:
+
+| key | text source | image source |
+|-----|-------------|--------------|
+| `lf-emb` | A0 `outputs/text_only`, jina-v5-omni-small cosine | D1 `outputs/d1_image_only/full`, jina image cosine |
+| `lf-judge` | B1 `outputs/llm_judge/full`, Qwen3.5 text judge | D1 `outputs/d1_image_only/full`, Qwen3.5 image-only judge |
+
+* *Pairs.* The two runs must have scored the same pairs (full runs); `fuse`
+  stops otherwise, and before writing anything if a prediction file is
+  missing. Pairs a source left without a score (a degenerate judge answer) are
+  dropped from every system of that pair and counted as `n_degenerate`.
+* *Normalisation* (`fusion.normalization`), within each dataset and without
+  labels: `zscore` (default) gives both sources mean 0 and sd 1, so α weighs the
+  sources rather than their spreads (an image cosine varies far less than a
+  text cosine); `rank` or `none` instead.
+* *Systems.* Per fused pair: `<key>-text` (α = 1) and `<key>-image` (α = 0), the
+  sources alone on the same pairs. The run checks they reproduce the sources'
+  own correlations. `<key>-a0.5` uses an α fixed in advance. `<key>-dev` uses α
+  chosen on development pairs and applied unchanged: CxC test from CxC val, SICK
+  test from SICK train + trial (`sick-all` minus `sick-test`, 4,934 pairs),
+  STS3k (no dev split of its own) from the mean over both. No test split's gold
+  scores enter a choice, and dev pairs never overlap the pairs α is applied to
+  (checked). The macro average covers cxc-test, sick-test and sts3k only.
+* *Outputs* (`outputs/late_fusion/`): the usual `predictions/`, `metrics`,
+  `summary.md`, plus `fusion_comparison.{csv,md}`, which gives each fused
+  system's gain over `<key>-text` with a paired-bootstrap 95% CI (1,000
+  resamples), and `alpha_sweep.{csv,md}`, Spearman for every α of the grid from
+  image only to text only (an analysis curve; no reported number is picked from
+  it). Each prediction row carries `alpha`, `alpha_source`, `text_score` and
+  `image_score`; the manifest records the chosen α per dataset and the sha256
+  of every source file.
+* *By category.* `report` and `breakdown` read the fused predictions like any
+  others, e.g. SICK by NLI label:
+  `python -m sts.cli breakdown --config configs/late_fusion.yaml --datasets sick-test sick-all`.
+
+On TSUBAME, `tsubame/job_fusion.sh` runs it as a CPU job; see
+[tsubame/README.md](tsubame/README.md#late-fusion-lf-cpu-job).
+
 ## Outputs
 
 Written to `experiment.output_dir` (default `outputs/text_only/`):
@@ -592,6 +642,7 @@ sts/
   report.py        metrics CSV/JSON + markdown summary
   diagnostics.py   validation checks + cross-model alignment probe
   breakdown.py     results by SICK NLI label / CxC sampling_method, from predictions on disk
+  fusion.py        late fusion (`fuse`): alpha * text + (1 - alpha) * image over finished runs' predictions
   cli.py           command-line entry point
   judge/           LLM-as-judge: prompts.py (specs + hashes; text v1, image-v1,
                    text-image-v1), scorer.py (next-token expectation), vlm.py
@@ -608,9 +659,11 @@ configs/
   d1_smoke.yaml          its 32-pair smoke test (render-text images, Qwen3.5-0.8B judge)
   d2_text_image.yaml     condition D2: sentence pair + D1's images, Qwen3.5 judge
   d2_smoke.yaml          its 32-pair smoke test (render-text images, Qwen3.5-0.8B judge)
+  late_fusion.yaml       late fusion of A0/B1 (text) with D1 (images), CPU only
+  late_fusion_smoke.yaml the same over the laptop smoke runs' outputs
 scripts/
   smoke_test.py    run twice + validate everything (--judge, --d1, --d2)
 tsubame/
   README.md  env.sh.example  activate_env.sh  prefetch_models.sh
-  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh  job_d1.sh  job_d2.sh
+  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh  job_d1.sh  job_d2.sh  job_fusion.sh
 ```

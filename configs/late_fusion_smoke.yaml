@@ -1,0 +1,65 @@
+# =============================================================================
+# Late fusion over the laptop smoke runs (32 pairs/dataset, stand-in models).
+#
+#   python scripts/smoke_test.py --config configs/smoke.yaml
+#   python scripts/smoke_test.py --config configs/llm_judge_smoke.yaml --judge
+#   python scripts/smoke_test.py --config configs/d1_smoke.yaml --d1
+#   python -m sts.cli fuse --config configs/late_fusion_smoke.yaml
+#
+# Exercises every fusion code path; the numbers mean nothing (different
+# stand-in models on each side, 32 pairs). All four smoke runs subsample with
+# the same limit and seed, so they scored the same pairs.
+# =============================================================================
+
+experiment:
+  name: late_fusion_smoke
+  condition: LF
+  output_dir: outputs/late_fusion_smoke
+  seed: 42
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: cpu
+  seed: 42
+
+fusion:
+  normalization: zscore
+  alphas: {start: 0.0, stop: 1.0, step: 0.05}
+  fixed_alpha: 0.5
+  bootstrap: 200
+  dev_sets:
+    sick-dev: {dataset: sick-all, exclude: [sick-test]}
+  select_alpha_on:
+    cxc-test: [cxc-val]
+    sick-test: [sick-dev]
+    sts3k: [cxc-val, sick-dev]
+  systems:
+    - key: lf-emb-stub
+      text:  {output_dir: outputs/smoke, model: minilm-l6-v2}
+      image: {output_dir: outputs/d1_smoke, model: d1-jina-v5-omni-small}
+    - key: lf-judge-stub
+      text:  {output_dir: outputs/llm_judge_smoke, model: qwen2.5-0.5b-stub}
+      image: {output_dir: outputs/d1_smoke, model: d1-qwen3.5-0.8b-stub}
+
+metrics:
+  bootstrap: 0
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  macro_average_over:
+    - cxc-test
+    - sick-test
+    - sts3k

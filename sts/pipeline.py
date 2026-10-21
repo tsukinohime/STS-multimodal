@@ -46,8 +46,9 @@ PREDICTION_COLUMNS = (
 
 #: Prediction columns the metric code recognises, in priority order. The
 #: embedding pipeline writes ``cosine_prediction``; the LLM-judge pipeline
-#: writes ``expected_score``. Both share every other column the metrics need.
-PREDICTION_COLUMN_CANDIDATES = ("expected_score", "cosine_prediction")
+#: writes ``expected_score``; late fusion writes ``fused_score``. All share
+#: every other column the metrics need.
+PREDICTION_COLUMN_CANDIDATES = ("expected_score", "cosine_prediction", "fused_score")
 
 
 def prediction_column_of(frame: pd.DataFrame) -> str:

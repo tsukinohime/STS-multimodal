@@ -322,6 +322,25 @@ smoke re-scores every pair in swapped order), ~101k forward passes in total.
 
 Outputs: `outputs/d2_text_image/{smoke_N,full}/`, laid out like the D1 runs.
 
+## Late fusion (LF): CPU job
+
+`job_fusion.sh` runs `python -m sts.cli fuse --config configs/late_fusion.yaml`
+(main README, "Late fusion"). It reads the per-pair predictions of finished
+runs and loads no model: under a minute and ~1.5 GB on the full datasets, so the
+smallest CPU allocation is enough.
+
+```bash
+qsub -g <group> -l <cpu resource>=1 -v STS_PYTHON="$(command -v python)" tsubame/job_fusion.sh
+```
+
+The sources are the default output directories of the earlier jobs:
+`outputs/text_only` (A0), `outputs/llm_judge/full` (B1) and
+`outputs/d1_image_only/full` (D1 embed + judge). If a run wrote elsewhere, edit
+its `output_dir` in `configs/late_fusion.yaml`. The job stops before writing
+anything and lists every missing prediction file. `STS_FUSION_SYSTEMS="lf-judge"`
+runs one fused pair only; `bash tsubame/job_fusion.sh --help` lists the rest.
+Results land in `outputs/late_fusion/`; start with `fusion_comparison.md`.
+
 ## Run (embedding)
 
 ```bash

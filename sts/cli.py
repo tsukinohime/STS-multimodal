@@ -9,6 +9,7 @@
     python -m sts.cli report   --config configs/text_only.yaml
     python -m sts.cli breakdown --config configs/llm_judge.yaml --datasets sick-all cxc-val \
                                 --baseline outputs/text_only
+    python -m sts.cli fuse     --config configs/late_fusion.yaml     # late fusion of finished runs (CPU)
     python -m sts.cli datasets
 
 Every run is fully described by its YAML file; the flags below only exist to
@@ -175,6 +176,31 @@ def command_judge(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_fuse(args: argparse.Namespace) -> int:
+    """Late fusion: weigh finished text and image runs' per-pair scores (no model loaded)."""
+    from .fusion import run_fusion
+
+    config = _config_from(args)
+    if config.fusion is None:
+        _log.error("%s has no `fusion:` section.", config.source_path)
+        return 1
+    if args.bootstrap is not None:
+        config.fusion.bootstrap = args.bootstrap
+    try:
+        metrics = run_fusion(config)
+    except (FileNotFoundError, ValueError) as exc:
+        # A missing or mismatched source run: the message names the file and the fix.
+        _log.error("%s", exc)
+        return 2
+    if metrics.empty:
+        _log.error("No results produced.")
+        return 1
+    _finalise(metrics, config, method="fusion")
+    print(f"  comparison  {config.tagged('fusion_comparison', '.md')}")
+    print(f"  alpha sweep {config.tagged('alpha_sweep', '.md')}\n")
+    return 0
+
+
 def command_report(args: argparse.Namespace) -> int:
     """Rebuild metrics and the summary from prediction CSVs already on disk.
 
@@ -184,9 +210,9 @@ def command_report(args: argparse.Namespace) -> int:
     from .pipeline import metric_rows, prediction_column_of
 
     config = _config_from(args)
-    keys = [m.key for m in config.enabled_models] + [j.key for j in config.enabled_judges]
+    keys = [m.key for m in config.enabled_models] + [j.key for j in config.enabled_judges] + config.fusion_keys
     rows: List[dict] = []
-    saw_judge = False
+    saw_judge = saw_fused = False
     for key in keys:
         for name in config.datasets:
             path = config.output_dir / "predictions" / key / f"{name}.csv"
@@ -195,8 +221,10 @@ def command_report(args: argparse.Namespace) -> int:
                 continue
             frame = pd.read_csv(path)
             column = prediction_column_of(frame)
-            if column == "expected_score":
-                saw_judge = True
+            if column in ("expected_score", "fused_score"):
+                # Degenerate judge answers, and pairs a fusion source left unscored, carry NaN.
+                saw_judge = saw_judge or column == "expected_score"
+                saw_fused = saw_fused or column == "fused_score"
                 n_all = len(frame)
                 frame = frame[frame[column].notna()]
                 extra = {"n_degenerate": n_all - len(frame)}
@@ -208,7 +236,8 @@ def command_report(args: argparse.Namespace) -> int:
     if not rows:
         _log.error("No prediction files found under %s", config.output_dir / "predictions")
         return 1
-    _finalise(pd.DataFrame(rows), config, method="judge" if saw_judge else "embedding")
+    _finalise(pd.DataFrame(rows), config,
+              method="judge" if saw_judge else "fusion" if saw_fused else "embedding")
     return 0
 
 
@@ -390,6 +419,15 @@ def build_parser() -> argparse.ArgumentParser:
     cache_parser.add_argument("--compact", action="store_true",
                               help="merge all shards into one file (fewer inodes on a cluster)")
     cache_parser.set_defaults(func=command_cache)
+
+    fuse_parser = subparsers.add_parser(
+        "fuse", help="late fusion: alpha * text + (1 - alpha) * image over finished runs' predictions "
+                     "(CPU, no model loaded)"
+    )
+    _add_common(fuse_parser)
+    fuse_parser.add_argument("--bootstrap", type=int, default=None,
+                             help="paired-bootstrap resamples for the gain over text (overrides fusion.bootstrap)")
+    fuse_parser.set_defaults(func=command_fuse)
 
     datasets_parser = subparsers.add_parser("datasets", help="list the registered datasets")
     datasets_parser.set_defaults(func=command_datasets)

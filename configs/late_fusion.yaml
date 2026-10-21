@@ -1,0 +1,89 @@
+# =============================================================================
+# Condition LF: late fusion of finished text and image runs.
+#
+#   python -m sts.cli fuse --config configs/late_fusion.yaml     # CPU, no model loaded
+#   (TSUBAME: qsub ... tsubame/job_fusion.sh)
+#
+# Per pair: fused = alpha * norm(text score) + (1 - alpha) * norm(image score),
+# read from the predictions/<model>/<dataset>.csv files the runs below already
+# wrote. Two fused pairs, each one model seeing the text vs the images:
+#   lf-emb    jina-v5-omni-small: text cosine (A0) + generated-image cosine (D1)
+#   lf-judge  Qwen3.5-35B-A3B:    text judge (B1)  + image-only judge (D1)
+#
+# Per fused pair it writes four prediction systems, scored on the same pairs:
+#   <key>-text   alpha = 1, the text run alone          (sanity: reproduces it)
+#   <key>-image  alpha = 0, the image run alone         (sanity: reproduces it)
+#   <key>-a0.5   alpha fixed in advance
+#   <key>-dev    alpha chosen on dev pairs (select_alpha_on), evaluation sets only
+# plus fusion_comparison.{csv,md} (gain over text-only, paired-bootstrap CI) and
+# alpha_sweep.{csv,md} (Spearman for every alpha of the grid).
+#
+# The output_dir paths are where the TSUBAME jobs wrote by default; change one
+# if that run went elsewhere. The runs must have scored the same pairs (full
+# runs), and must be finished: fuse reads, it never runs a model.
+# =============================================================================
+
+experiment:
+  name: late_fusion
+  condition: LF
+  output_dir: outputs/late_fusion
+  seed: 42
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+# Every dataset gets the -text, -image and -a0.5 systems; the -dev systems only
+# the evaluation datasets of select_alpha_on below.
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: cpu
+  seed: 42
+
+fusion:
+  # zscore: both sources on mean 0 / sd 1 within each dataset (no labels), so
+  # alpha weighs the sources, not their spreads. Alternatives: rank | none.
+  normalization: zscore
+  alphas: {start: 0.0, stop: 1.0, step: 0.05}   # the sweep grid; dev alphas come from it too
+  fixed_alpha: 0.5
+  bootstrap: 1000                               # paired resamples, fused vs text-only
+
+  # Where alpha may be chosen: never on a test split, never on the pairs it is
+  # applied to (checked at run time).
+  dev_sets:
+    sick-dev: {dataset: sick-all, exclude: [sick-test]}   # SICK TRAIN + TRIAL, 4,934 pairs
+  select_alpha_on:
+    cxc-test: [cxc-val]
+    sick-test: [sick-dev]
+    sts3k: [cxc-val, sick-dev]      # STS3k has no dev split: the mean over both
+
+  systems:
+    - key: lf-emb
+      text:  {output_dir: outputs/text_only, model: jina-v5-omni-small}
+      image: {output_dir: outputs/d1_image_only/full, model: d1-jina-v5-omni-small}
+      notes: "A0 text cosine + D1 image cosine, one encoder."
+    - key: lf-judge
+      text:  {output_dir: outputs/llm_judge/full, model: qwen3.5-35b-a3b}
+      image: {output_dir: outputs/d1_image_only/full, model: d1-qwen3.5-35b-a3b}
+      notes: "B1 text judge + D1 image-only judge, one checkpoint."
+
+metrics:
+  bootstrap: 0                # per-system CIs; the paired comparison has its own
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  # The evaluation datasets only: cxc-val and SICK train + trial choose -dev's
+  # alpha, so they are not reported as results.
+  macro_average_over:
+    - cxc-test
+    - sick-test
+    - sts3k

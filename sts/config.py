@@ -292,6 +292,123 @@ class ImagesConfig:
         self.store_dir = Path(self.store_dir)
 
 
+#: How each source's scores are put on one footing before fusing, per dataset.
+FUSION_NORMALIZATIONS = ("zscore", "rank", "none")
+
+
+def _alpha_grid(start: float, stop: float, step: float) -> List[float]:
+    """``start`` to ``stop`` inclusive, without float drift (0.30000000000000004)."""
+    count = int(round((stop - start) / step))
+    return [round(start + i * step, 6) for i in range(count + 1)]
+
+
+@dataclass
+class FusionSource:
+    """One input of a late fusion: the per-pair predictions a finished run wrote."""
+
+    output_dir: Path          # that run's output directory
+    model: str                # the model or judge key whose predictions/<model>/ files are read
+
+    def __post_init__(self) -> None:
+        self.output_dir = Path(self.output_dir)
+
+    def predictions(self, dataset_name: str) -> Path:
+        return self.output_dir / "predictions" / self.model / f"{dataset_name}.csv"
+
+
+@dataclass
+class FusionSystem:
+    """A text system and an image system, fused as alpha * text + (1 - alpha) * image."""
+
+    key: str
+    text: FusionSource
+    image: FusionSource
+    enabled: bool = True
+    notes: str = ""
+
+
+@dataclass
+class DevSet:
+    """Pairs alpha may be chosen on: a dataset minus every pair of the ``exclude`` datasets."""
+
+    dataset: str
+    exclude: List[str] = field(default_factory=list)
+
+
+@dataclass
+class FusionConfig:
+    """Late fusion of finished runs' predictions (condition LF). No model is loaded."""
+
+    systems: List[FusionSystem] = field(default_factory=list)
+    alphas: List[float] = field(default_factory=lambda: _alpha_grid(0.0, 1.0, 0.05))
+    fixed_alpha: float = 0.5
+    normalization: str = "zscore"     # zscore | rank | none, per dataset, label-free
+    bootstrap: int = 1000             # paired resamples for each fused system's gain over text
+    dev_sets: Dict[str, DevSet] = field(default_factory=dict)
+    #: Evaluation dataset -> the dev sets (or datasets) its alpha is chosen on.
+    select_alpha_on: Dict[str, List[str]] = field(default_factory=dict)
+
+    @property
+    def enabled_systems(self) -> List[FusionSystem]:
+        return [s for s in self.systems if s.enabled]
+
+    def output_keys(self, system: FusionSystem) -> Dict[str, str]:
+        """The prediction systems one fused pair of sources writes, by role."""
+        return {
+            "text": f"{system.key}-text",
+            "image": f"{system.key}-image",
+            "fixed": f"{system.key}-a{self.fixed_alpha:g}",
+            "dev": f"{system.key}-dev",
+        }
+
+
+def _parse_fusion(raw: Dict[str, Any], base: Path) -> FusionConfig:
+    raw = dict(raw)
+    unknown = set(raw) - set(FusionConfig.__dataclass_fields__)
+    if unknown:
+        raise ValueError(f"fusion: unknown keys {sorted(unknown)}")
+
+    systems: List[FusionSystem] = []
+    for entry in raw.pop("systems", None) or []:
+        entry = dict(entry)
+        unknown = set(entry) - set(FusionSystem.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"fusion system {entry.get('key')!r}: unknown keys {sorted(unknown)}")
+        for role in ("text", "image"):
+            source = dict(entry.get(role) or {})
+            if set(source) != {"output_dir", "model"}:
+                raise ValueError(f"fusion system {entry.get('key')!r}: {role} needs exactly output_dir and model")
+            entry[role] = FusionSource(output_dir=_expand(source["output_dir"], base), model=str(source["model"]))
+        systems.append(FusionSystem(**entry))
+
+    alphas = raw.pop("alphas", None)
+    if isinstance(alphas, dict):
+        raw["alphas"] = _alpha_grid(float(alphas.get("start", 0.0)), float(alphas.get("stop", 1.0)),
+                                    float(alphas["step"]))
+    elif alphas is not None:
+        raw["alphas"] = sorted({round(float(a), 6) for a in alphas})
+    raw["dev_sets"] = {
+        name: DevSet(**spec) if isinstance(spec, dict) else DevSet(dataset=str(spec))
+        for name, spec in (raw.get("dev_sets") or {}).items()
+    }
+    raw["select_alpha_on"] = {
+        target: [names] if isinstance(names, str) else list(names)
+        for target, names in (raw.get("select_alpha_on") or {}).items()
+    }
+    fusion = FusionConfig(systems=systems, **raw)
+
+    if fusion.normalization not in FUSION_NORMALIZATIONS:
+        raise ValueError(f"fusion.normalization must be one of {FUSION_NORMALIZATIONS}, got {fusion.normalization!r}")
+    if not all(0.0 <= a <= 1.0 for a in [*fusion.alphas, fusion.fixed_alpha]):
+        raise ValueError("fusion: every alpha must lie in [0, 1]")
+    if 0.0 not in fusion.alphas or 1.0 not in fusion.alphas:
+        raise ValueError("fusion.alphas must include 0 and 1 (the image-only and text-only endpoints)")
+    keys = [s.key for s in fusion.systems]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"fusion: duplicate system keys {keys}")
+    return fusion
+
+
 @dataclass
 class MetricsConfig:
     bootstrap: int = 0          # 0 disables; 1000 gives the pair-level 95% CI
@@ -318,6 +435,8 @@ class ExperimentConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     images: ImagesConfig = field(default_factory=ImagesConfig)
+    #: Late fusion of finished runs (condition LF); None for every other config.
+    fusion: Optional[FusionConfig] = None
     #: Experimental condition this config implements (e.g. "D1"); selects the
     #: method paragraph of the summary. Empty for the text-only baselines.
     condition: str = ""
@@ -344,6 +463,13 @@ class ExperimentConfig:
     def uses_images(self) -> bool:
         """True when an enabled model or judge reads generated images."""
         return any(reads_images(s.input) for s in [*self.enabled_models, *self.enabled_judges])
+
+    @property
+    def fusion_keys(self) -> List[str]:
+        """Prediction systems the late fusion writes (empty without a ``fusion`` section)."""
+        if self.fusion is None:
+            return []
+        return [key for s in self.fusion.enabled_systems for key in self.fusion.output_keys(s).values()]
 
     def judge_by_key(self, key: str) -> JudgeSpec:
         for judge in self.judges:
@@ -391,6 +517,7 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
     models_raw = raw.get("models", []) or []
     judges_raw = raw.get("judges", []) or []
     images_raw = dict(raw.get("images", {}) or {})
+    fusion_raw = raw.get("fusion")
 
     data = DataPaths(
         root=_expand(data_raw.get("root", REPO_ROOT / "data" / "raw"), base),
@@ -427,8 +554,9 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
             raise ValueError(f"judge {entry['key']!r}: unknown keys {sorted(unknown)}")
         judges.append(JudgeSpec(**entry))
 
-    if not models and not judges:
-        raise ValueError(f"{path}: no models or judges defined")
+    fusion = _parse_fusion(fusion_raw, base) if fusion_raw else None
+    if not models and not judges and fusion is None:
+        raise ValueError(f"{path}: no models, judges or fusion systems defined")
     clash = {m.key for m in models} & {j.key for j in judges}
     if clash:
         raise ValueError(f"{path}: keys used by both a model and a judge: {sorted(clash)}")
@@ -465,6 +593,7 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
         runtime=runtime,
         metrics=metrics,
         images=images,
+        fusion=fusion,
         condition=str(experiment.get("condition", "") or ""),
         source_path=path,
     )
@@ -490,16 +619,19 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
             # per-file paths the YAML set relative to the old one.
             config.data = DataPaths(root=Path(value))
         elif field_name == "models":
-            # One flag selects among encoders and judges alike.
+            # One flag selects among encoders, judges and fused systems alike.
             wanted = set(value)
-            known = {m.key for m in config.models} | {j.key for j in config.judges}
+            fused = config.fusion.systems if config.fusion is not None else []
+            known = {m.key for m in config.models} | {j.key for j in config.judges} | {f.key for f in fused}
             missing = wanted - known
             if missing:
-                raise ValueError(f"--models: no such model/judge key(s) {sorted(missing)}")
+                raise ValueError(f"--models: no such model/judge/fusion key(s) {sorted(missing)}")
             for model in config.models:
                 model.enabled = model.key in wanted
             for judge in config.judges:
                 judge.enabled = judge.key in wanted
+            for system in fused:
+                system.enabled = system.key in wanted
         elif hasattr(config, field_name):
             setattr(config, field_name, value)
         else:

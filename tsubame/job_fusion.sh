@@ -1,0 +1,85 @@
+#!/bin/bash
+# Late fusion (condition LF) of finished runs' predictions: CPU only, no model,
+# under a minute for the full datasets (~1.5 GB memory). Run from the repository root.
+#   qsub -g <group> -l <cpu resource>=1 -v STS_PYTHON="$(command -v python)" tsubame/job_fusion.sh
+# STS_PYTHON selects an already prepared interpreter. When omitted, use the
+# existing tsubame/activate_env.sh and its env.sh configuration instead.
+#$ -cwd
+#$ -N sts-fusion
+#$ -l h_rt=0:30:00
+#$ -j y
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: qsub -g <group> -l <cpu resource>=1 [qsub options] tsubame/job_fusion.sh
+
+Reads the per-pair predictions of the finished runs named in the config
+(default configs/late_fusion.yaml: A0 text_only, B1 llm_judge/full, D1
+d1_image_only/full), fuses text and image scores, and writes predictions,
+metrics, summary, fusion_comparison and alpha_sweep to the config's output
+directory (default outputs/late_fusion). Nothing is resumable or cached: a
+rerun recomputes everything in under a minute.
+
+Optional environment variables (pass with qsub -v):
+  STS_PYTHON            Absolute path to the prepared Python interpreter.
+                        If absent, activate the environment via env.sh.
+  STS_REPO              Repository root (default: submission directory).
+  STS_DATA_ROOT         Override all dataset paths.
+  STS_FUSION_CONFIG     Config file (default: configs/late_fusion.yaml).
+  STS_FUSION_OUTPUT_DIR Output directory (default: the config's).
+  STS_FUSION_SYSTEMS    Space-separated fusion keys to run (default: all), e.g. "lf-judge".
+EOF
+}
+
+case "${1:-}" in
+  "") ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+# Grid Engine spools the script away from the repository, so do not infer the
+# repository from BASH_SOURCE. Submit from the repo root or pass STS_REPO.
+cd "${STS_REPO:-${SGE_O_WORKDIR:-$PWD}}"
+export STS_REPO="$PWD"
+
+fusion_config="${STS_FUSION_CONFIG:-$STS_REPO/configs/late_fusion.yaml}"
+
+if [[ -n "${STS_PYTHON:-}" ]]; then
+  fusion_python="$STS_PYTHON"
+  if [[ "$fusion_python" != /* || ! -x "$fusion_python" ]]; then
+    echo "[error] STS_PYTHON must be an absolute path to an executable Python" >&2
+    exit 2
+  fi
+else
+  source "$STS_REPO/tsubame/activate_env.sh"
+  cd "$STS_REPO"
+  fusion_python="$(command -v python)"
+fi
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${NSLOTS:-4}}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export PYTHONUNBUFFERED=1
+
+trap 'fusion_status=$?; echo "[job] finished with status $fusion_status at $(date +%Y-%m-%dT%H:%M:%S%z)"' EXIT
+
+echo "[job] id=${JOB_ID:-manual} host=$(hostname)"
+echo "[job] python=$fusion_python config=$fusion_config"
+
+fusion_command=("$fusion_python" -u -m sts.cli fuse --config "$fusion_config")
+if [[ -n "${STS_FUSION_OUTPUT_DIR:-}" ]]; then
+  fusion_command+=(--output-dir "$STS_FUSION_OUTPUT_DIR")
+fi
+if [[ -n "${STS_DATA_ROOT:-}" ]]; then
+  fusion_command+=(--data-root "$STS_DATA_ROOT")
+fi
+if [[ -n "${STS_FUSION_SYSTEMS:-}" ]]; then
+  read -r -a fusion_systems <<< "$STS_FUSION_SYSTEMS"
+  fusion_command+=(--models "${fusion_systems[@]}")
+fi
+
+printf '[job] command:'
+printf ' %q' "${fusion_command[@]}"
+printf '\n'
+"${fusion_command[@]}"
