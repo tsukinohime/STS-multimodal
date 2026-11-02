@@ -8,8 +8,10 @@ task?**
 This repository holds **Milestone 1 — the text-only baselines** that every
 multimodal result is compared against (embedding cosine, and an LLM judge), and
 the image conditions **D1: generated image only** (see
-[below](#condition-d1-generated-image-only)) and **D2: sentence pair + generated
-images** ([below](#condition-d2-sentence-pair--generated-images)).
+[below](#condition-d1-generated-image-only)), **D2: sentence pair + generated
+images** ([below](#condition-d2-sentence-pair--generated-images)) and its
+control **E2: sentence pair + mismatched images**
+([below](#condition-e2-sentence-pair--mismatched-images)).
 
 ## What Milestone 1 does
 
@@ -469,6 +471,81 @@ python -m sts.cli breakdown --config configs/d2_text_image.yaml \
 On TSUBAME, `tsubame/job_d2.sh` runs each stage as its own job; see
 [tsubame/README.md](tsubame/README.md#condition-d2-sentence-pair--generated-images).
 
+## Condition E2: sentence pair + mismatched images
+
+Does the D2 judge actually use its images? E2 runs D2's judge with D2's prompt,
+unchanged, but shows every sentence pair the two images generated for
+*another* pair. A judge that reads its images loses correlation; one that
+ignores them scores every pair exactly as in D2.
+
+```bash
+python -m sts.cli judge     --config configs/e2_mismatched.yaml   # 1. VLM judge: pair + another pair's images (GPU)
+python -m sts.cli report    --config configs/e2_mismatched.yaml
+python -m sts.cli compare   --config configs/e2_mismatched.yaml   # 2. against D2 and B1, pair by pair (CPU)
+python -m sts.cli breakdown --config configs/e2_mismatched.yaml \
+    --datasets sick-all sick-test cxc-val cxc-test               #    the same three systems by category (CPU)
+python scripts/smoke_test.py --config configs/e2_smoke.yaml --e2     # laptop smoke test, stand-in models
+```
+
+**Images.** D1's store, as for D2: the `images` block is D1's, setting for
+setting, and E2 generates nothing.
+
+**Which images.** The judge sets `images_from: other-pair`
+([sts/judge/mismatch.py](sts/judge/mismatch.py)). Per dataset, a random
+derangement drawn from `mismatch_seed` (0) and the dataset name gives each pair
+a donor, the pair whose two images it is shown:
+
+* every pair's images are shown exactly once, so E2 shows D2's image pairs,
+  each next to another sentence pair;
+* never with their own pair, nor with a pair that shares a sentence (exact
+  text) or, in CxC, a COCO image, since those images would be partly its own.
+  A plain shuffle leaves 3–24 such pairs per dataset;
+* the donor's slot order is kept: its first sentence's image comes first;
+* each dataset is deranged on its own, so `sick-all` judges its 4,906 test
+  pairs again, with other donors than in `sick-test`.
+
+Gold and donor gold are uncorrelated by construction: ρ between −0.005 and
++0.006 on the five full datasets.
+
+**Judge.** D2's, setting for setting: Qwen3.5-35B-A3B with its vision encoder,
+prompt set `text-image-v1`, images at 512 px, thinking off, digit expectation.
+The prompt text is D2's to the byte (same `prompt_hash`), so it still says the
+images were generated from the sentences; only the pixels differ. The
+order-symmetry check swaps the sentences together with the images shown for
+them. Prediction rows add `images_from`, `mismatch_seed`, `donor_pair_id`,
+`donor_sentence1_id`, `donor_sentence2_id` and `donor_gold_score`, and each
+manifest run records ρ(gold, donor gold) and ρ(score, donor gold).
+
+**Caches** live in `.cache/e2/`. A key is the sentence pair plus the donor's
+two sentences, and the fingerprint carries `images_from`, so nothing mixes with
+D2's judgments. The D1, D2 and B1 cache fingerprints are unchanged.
+
+**Comparison.** `compare` reads finished runs only (CPU, about a minute). The
+config's `comparison:` section names D2 as `matched` and B1 as `no_image`
+(`outputs/d2_text_image/full`, `outputs/llm_judge/full`). On the pairs E2
+scored, `comparison.md` has, per dataset:
+
+| table | contents |
+|---|---|
+| Spearman / Pearson with gold | **none** (B1), **own** (D2) and **other** (E2) on the same pairs; other − own, other − none and own − none, each with a 1,000-resample paired-bootstrap 95% CI |
+| How far the scores moved | per pair of systems, the mean absolute score difference on the judge's scale and the Spearman between their scores |
+| Do the scores follow the images shown? | image following, ρ(other − own, donor gold − gold); ρ(score, donor gold); ρ(gold, donor gold) as the randomisation check |
+
+Reading it: other and own share the prompt text, so a judge that ignores its
+images gives other = own pair for pair (a difference whose CI covers 0, mean
+shift 0, ρ = 1, no image following). A judge that reads them loses correlation
+when they belong to another pair, moves its scores, and moves them toward the
+donor's similarity. other − none says whether wrong images are worse than none.
+E2 tests whether the images are read, not whether they help: images the judge
+reads but that only repeat the sentences add nothing in D2 and still cost here.
+
+`breakdown` without `--baseline` uses the `comparison:` runs as baselines, so
+the command above sets E2, D2 and B1 side by side by SICK NLI label and CxC
+sampling method.
+
+On TSUBAME, `tsubame/job_e2.sh` runs each stage as its own job; see
+[tsubame/README.md](tsubame/README.md#condition-e2-sentence-pair--mismatched-images).
+
 ## Late fusion (LF): weighing text against images
 
 Per pair, `fused = α · norm(text score) + (1 − α) · norm(image score)`, read from
@@ -643,10 +720,12 @@ sts/
   diagnostics.py   validation checks + cross-model alignment probe
   breakdown.py     results by SICK NLI label / CxC sampling_method, from predictions on disk
   fusion.py        late fusion (`fuse`): alpha * text + (1 - alpha) * image over finished runs' predictions
+  comparison.py    `compare`: a judge run vs the runs it controls for (E2 vs D2, B1), paired bootstrap
   cli.py           command-line entry point
   judge/           LLM-as-judge: prompts.py (specs + hashes; text v1, image-v1,
                    text-image-v1), scorer.py (next-token expectation), vlm.py
-                   (the same, shown two generated images), pipeline.py (orchestration)
+                   (the same, shown two generated images), mismatch.py (E2: each
+                   pair's donor), pipeline.py (orchestration)
   images/          generated images: store.py (sharded tar store), generators.py
                    (FLUX.2 [klein], render-text stand-in), pipeline.py (`imagine`)
   models/images.py image input for an encoder: sentences -> their images' embeddings
@@ -659,11 +738,13 @@ configs/
   d1_smoke.yaml          its 32-pair smoke test (render-text images, Qwen3.5-0.8B judge)
   d2_text_image.yaml     condition D2: sentence pair + D1's images, Qwen3.5 judge
   d2_smoke.yaml          its 32-pair smoke test (render-text images, Qwen3.5-0.8B judge)
+  e2_mismatched.yaml     condition E2: sentence pair + another pair's images, D2's judge; compared with D2 and B1
+  e2_smoke.yaml          its 32-pair smoke test (render-text images, Qwen3.5-0.8B judge)
   late_fusion.yaml       late fusion of A0/B1 (text) with D1 (images), CPU only
   late_fusion_smoke.yaml the same over the laptop smoke runs' outputs
 scripts/
-  smoke_test.py    run twice + validate everything (--judge, --d1, --d2)
+  smoke_test.py    run twice + validate everything (--judge, --d1, --d2, --e2)
 tsubame/
   README.md  env.sh.example  activate_env.sh  prefetch_models.sh
-  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh  job_d1.sh  job_d2.sh  job_fusion.sh
+  job_sts.sh  submit.sh  job_judge.sh  job_breakdown.sh  job_d1.sh  job_d2.sh  job_e2.sh  job_fusion.sh
 ```

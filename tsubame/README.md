@@ -322,6 +322,66 @@ smoke re-scores every pair in swapped order), ~101k forward passes in total.
 
 Outputs: `outputs/d2_text_image/{smoke_N,full}/`, laid out like the D1 runs.
 
+## Condition E2: sentence pair + mismatched images
+
+`job_e2.sh STAGE [smoke [N] | full]` runs one stage of
+`configs/e2_mismatched.yaml` per job (details: main README, "Condition E2").
+The judge is D2's with D2's prompt, shown each sentence pair with the two images
+generated for another pair:
+
+| stage | what it does | resources |
+|-------|--------------|-----------|
+| `judge` | Qwen3.5-35B-A3B shown the sentence pair and another pair's two images | a whole GPU (`gpu_1` / `node_q`) |
+| `report` | rebuilds the summary from the predictions | CPU only |
+| `compare` | `sts.cli compare` against D2 and B1 on the same pairs, then `sts.cli breakdown` by category | CPU only, about a minute |
+
+Nothing new to download, but E2 builds on three finished runs:
+
+* **D1's full `imagine`.** E2 has no images of its own: pass the **same
+  `STS_IMAGE_DIR`** as the D1 and D2 jobs. A sentence without an image stops
+  the judge with `MissingImagesError` before the weights load.
+* **D2's and B1's full judge runs**, read by `compare` only, from
+  `outputs/d2_text_image/full` and `outputs/llm_judge/full`: the `comparison:`
+  section of the YAML. Edit it if they went elsewhere; `compare` stops and lists
+  every missing prediction file.
+
+```bash
+py="$(command -v python)"; img=/gs/fs/tga-kiban-arase/zhu/sts/images   # D1's store
+# 1. smoke: 32 pairs per dataset, then the comparison on those 32 pairs
+id=$(qsub -terse -g <group> -l gpu_1=1 -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_e2.sh judge smoke 32)
+qsub -g <group> -l <cpu resource>=1 -hold_jid "$id" -v STS_PYTHON="$py" tsubame/job_e2.sh compare smoke 32
+# 2. full, after checking the smoke run
+id=$(qsub -terse -g <group> -l gpu_1=1 -l h_rt=<HH:MM:SS> -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_e2.sh judge full)
+qsub -g <group> -l <cpu resource>=1 -hold_jid "$id" -v STS_PYTHON="$py",STS_IMAGE_DIR="$img" tsubame/job_e2.sh report full
+qsub -g <group> -l <cpu resource>=1 -hold_jid "$id" -v STS_PYTHON="$py" tsubame/job_e2.sh compare full
+```
+
+What to check in the smoke run, `outputs/e2_mismatched/smoke_32/`:
+
+* `prompts/*.md` names, under `input`, the pair whose images the example
+  prompt carried. The file names end in D2's prompt hashes (compare with
+  `outputs/d2_text_image/smoke_32/prompts/`): the prompt text is unchanged.
+* the prediction CSVs carry `donor_pair_id`, never equal to `pair_id`, and
+  `donor_gold_score`; `manifest__judge-<jobid>.json` has a `mismatch` record per
+  dataset whose `spearman_gold_vs_donor_gold` is near 0.
+* `comparison.md` sets the 32 pairs per dataset against the full D2 and B1
+  predictions for the same pairs. At n = 32 its CIs are too wide to read
+  anything from; the smoke run only exercises the stage.
+
+Sizing `h_rt`: E2 judges ~107k prompts against D2's ~102k (each dataset is
+deranged on its own, so sick-all no longer reuses sick-test's judgments), each
+as long as D2's. Take D2's full judge time (`runtime_seconds` per dataset in its
+`manifest__judge-*.json`) plus a margin. The judge is resumable like D2's: an
+`h_rt` kill loses at most one unflushed block of 512 pairs, and resubmitting the
+same command continues. `STS_E2_DATASETS` splits it over several GPUs exactly
+like `STS_D2_DATASETS`; then hold `report` and `compare` on every judge job,
+`-hold_jid "$id1,$id2,$id3"`. `bash tsubame/job_e2.sh --help` lists every
+variable.
+
+Outputs: `outputs/e2_mismatched/{smoke_N,full}/`, laid out like the D2 runs,
+plus `comparison.{md,csv,json}` and `breakdown/`. Start with `comparison.md`;
+the main README explains how to read it.
+
 ## Late fusion (LF): CPU job
 
 `job_fusion.sh` runs `python -m sts.cli fuse --config configs/late_fusion.yaml`

@@ -6,7 +6,8 @@ the probability-weighted expectation over the answer digits, nothing generated
 processor, and every prompt carries two images: the ones the generator made
 from the pair's two sentences, read from the image store. The prompt set
 decides what else the prompt holds: nothing of the sentences (``image-v1``,
-condition D1) or the sentence pair itself (``text-image-v1``, D2).
+condition D1) or the sentence pair itself (``text-image-v1``, D2). Condition
+E2 renders the D2 prompt with another pair's two images in the slots.
 
 For Qwen3.5 the loading class matters. ``AutoModelForCausalLM`` resolves the
 checkpoint to ``Qwen3_5MoeForCausalLM``, the language model alone — that is how
@@ -19,7 +20,7 @@ language-model weights are the same tensors either way.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -69,7 +70,13 @@ class VLMJudge(LLMJudge):
         return tokenizer, model, template
 
     # -- prompt plumbing ---------------------------------------------------
-    def render(self, spec: PromptSpec, sentence_a: str, sentence_b: str) -> ImagePrompt:
+    def render(
+        self, spec: PromptSpec, sentence_a: str, sentence_b: str, images: Optional[Tuple[str, str]] = None
+    ) -> ImagePrompt:
+        """The prompt for (a, b); ``images`` names the sentences whose images fill the slots.
+
+        By default the pair's own; E2 passes another pair's two sentences.
+        """
         if input_of(spec) != self.input:
             raise ValueError(
                 f"{self.key} takes {self.input} input, but prompt {spec.family}/{spec.version} is for "
@@ -84,7 +91,7 @@ class VLMJudge(LLMJudge):
             add_generation_prompt=True,
             **kwargs,
         )
-        return ImagePrompt(text=text, images=(sentence_a, sentence_b))
+        return ImagePrompt(text=text, images=images or (sentence_a, sentence_b))
 
     # -- scoring -----------------------------------------------------------
     def _load_images(self, batch: Sequence[ImagePrompt]) -> List:

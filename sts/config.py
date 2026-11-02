@@ -130,6 +130,9 @@ class RuntimeConfig:
 INPUT_KINDS = ("text", "image", "text+image")
 #: An encoder embeds one modality per sentence; only a judge takes both.
 MODEL_INPUT_KINDS = ("text", "image")
+#: Whose generated images an image judge is shown: each sentence's own (D1, D2),
+#: or the two images of another pair of the same dataset (E2).
+IMAGE_SOURCES = ("own", "other-pair")
 
 
 def reads_images(input_kind: str) -> bool:
@@ -214,11 +217,18 @@ class JudgeSpec:
     trust_remote_code: bool = False
     input: str = "text"                 # text | image (the generated images instead) | text+image (both)
     image_size: Optional[int] = None    # image input: longer side in pixels; None = as generated
+    images_from: str = "own"            # own: each sentence's image | other-pair: another pair's two (E2)
+    mismatch_seed: int = 0              # other-pair: seed of the derangement that picks each pair's donor
     enabled: bool = True
     notes: str = ""
 
     def fingerprint(self) -> Dict[str, Any]:
-        """Settings that change a judgment; the prompt hash is added at run time."""
+        """Settings that change a judgment; the prompt hash is added at run time.
+
+        ``images_from`` joins only when it is not ``own``, so D1 and D2 caches
+        keep their hashes. The seed stays out: the cache key names the donor
+        sentences, so a judgment is valid under any seed that shows them.
+        """
         return {
             "model_id": self.model_id,
             "backend": self.backend,
@@ -226,6 +236,7 @@ class JudgeSpec:
             "enable_thinking": self.enable_thinking,
             "dtype": self.dtype,
             **_input_fingerprint(self.input, self.image_size),
+            **({"images_from": self.images_from} if self.images_from != "own" else {}),
         }
 
 
@@ -304,7 +315,7 @@ def _alpha_grid(start: float, stop: float, step: float) -> List[float]:
 
 @dataclass
 class FusionSource:
-    """One input of a late fusion: the per-pair predictions a finished run wrote."""
+    """The per-pair predictions a finished run wrote: a late-fusion input, or a comparison reference."""
 
     output_dir: Path          # that run's output directory
     model: str                # the model or judge key whose predictions/<model>/ files are read
@@ -362,6 +373,13 @@ class FusionConfig:
         }
 
 
+def _parse_source(raw: Any, base: Path, where: str) -> FusionSource:
+    source = dict(raw or {})
+    if set(source) != {"output_dir", "model"}:
+        raise ValueError(f"{where} needs exactly output_dir and model")
+    return FusionSource(output_dir=_expand(source["output_dir"], base), model=str(source["model"]))
+
+
 def _parse_fusion(raw: Dict[str, Any], base: Path) -> FusionConfig:
     raw = dict(raw)
     unknown = set(raw) - set(FusionConfig.__dataclass_fields__)
@@ -375,10 +393,7 @@ def _parse_fusion(raw: Dict[str, Any], base: Path) -> FusionConfig:
         if unknown:
             raise ValueError(f"fusion system {entry.get('key')!r}: unknown keys {sorted(unknown)}")
         for role in ("text", "image"):
-            source = dict(entry.get(role) or {})
-            if set(source) != {"output_dir", "model"}:
-                raise ValueError(f"fusion system {entry.get('key')!r}: {role} needs exactly output_dir and model")
-            entry[role] = FusionSource(output_dir=_expand(source["output_dir"], base), model=str(source["model"]))
+            entry[role] = _parse_source(entry.get(role), base, f"fusion system {entry.get('key')!r}: {role}")
         systems.append(FusionSystem(**entry))
 
     alphas = raw.pop("alphas", None)
@@ -410,6 +425,38 @@ def _parse_fusion(raw: Dict[str, Any], base: Path) -> FusionConfig:
 
 
 @dataclass
+class ComparisonConfig:
+    """Finished runs a judge run is set against, pair by pair (``sts.cli compare``, no model).
+
+    For E2: ``matched`` is the same judge and prompt shown each pair's own
+    images (D2), ``no_image`` the same checkpoint on the sentence pair alone (B1).
+    """
+
+    matched: FusionSource
+    no_image: Optional[FusionSource] = None
+    bootstrap: int = 1000             # paired resamples per difference
+
+    @property
+    def references(self) -> Dict[str, FusionSource]:
+        """The configured references by role, in report order."""
+        return {role: source for role, source in (("no_image", self.no_image), ("matched", self.matched))
+                if source is not None}
+
+
+def _parse_comparison(raw: Dict[str, Any], base: Path) -> ComparisonConfig:
+    raw = dict(raw)
+    unknown = set(raw) - set(ComparisonConfig.__dataclass_fields__)
+    if unknown:
+        raise ValueError(f"comparison: unknown keys {sorted(unknown)}")
+    if not raw.get("matched"):
+        raise ValueError("comparison: needs matched, the run shown each pair's own images")
+    for role in ("matched", "no_image"):
+        if raw.get(role) is not None:
+            raw[role] = _parse_source(raw[role], base, f"comparison.{role}")
+    return ComparisonConfig(**raw)
+
+
+@dataclass
 class MetricsConfig:
     bootstrap: int = 0          # 0 disables; 1000 gives the pair-level 95% CI
     bootstrap_seed: int = 12345
@@ -437,6 +484,8 @@ class ExperimentConfig:
     images: ImagesConfig = field(default_factory=ImagesConfig)
     #: Late fusion of finished runs (condition LF); None for every other config.
     fusion: Optional[FusionConfig] = None
+    #: Runs the judges are compared with by ``sts.cli compare`` (E2: D2 and B1).
+    comparison: Optional[ComparisonConfig] = None
     #: Experimental condition this config implements (e.g. "D1"); selects the
     #: method paragraph of the summary. Empty for the text-only baselines.
     condition: str = ""
@@ -518,6 +567,7 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
     judges_raw = raw.get("judges", []) or []
     images_raw = dict(raw.get("images", {}) or {})
     fusion_raw = raw.get("fusion")
+    comparison_raw = raw.get("comparison")
 
     data = DataPaths(
         root=_expand(data_raw.get("root", REPO_ROOT / "data" / "raw"), base),
@@ -563,6 +613,14 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
     for spec, kinds in [*((m, MODEL_INPUT_KINDS) for m in models), *((j, INPUT_KINDS) for j in judges)]:
         if spec.input not in kinds:
             raise ValueError(f"{spec.key!r}: input must be one of {kinds}, got {spec.input!r}")
+    for judge in judges:
+        if judge.images_from not in IMAGE_SOURCES:
+            raise ValueError(f"{judge.key!r}: images_from must be one of {IMAGE_SOURCES}, got {judge.images_from!r}")
+        if judge.images_from != "own" and judge.input != "text+image":
+            raise ValueError(f"{judge.key!r}: images_from: {judge.images_from} needs input: text+image "
+                             "(E2 shows the sentence pair with another pair's images)")
+        if not (isinstance(judge.mismatch_seed, int) and judge.mismatch_seed >= 0):
+            raise ValueError(f"{judge.key!r}: mismatch_seed must be a non-negative integer")
 
     generator_raw = images_raw.pop("generator", None)
     generator = None
@@ -594,6 +652,7 @@ def load_config(path: str | Path, overrides: Optional[Dict[str, Any]] = None) ->
         metrics=metrics,
         images=images,
         fusion=fusion,
+        comparison=_parse_comparison(comparison_raw, base) if comparison_raw else None,
         condition=str(experiment.get("condition", "") or ""),
         source_path=path,
     )

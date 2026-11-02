@@ -10,6 +10,7 @@
     python -m sts.cli breakdown --config configs/llm_judge.yaml --datasets sick-all cxc-val \
                                 --baseline outputs/text_only
     python -m sts.cli fuse     --config configs/late_fusion.yaml     # late fusion of finished runs (CPU)
+    python -m sts.cli compare  --config configs/e2_mismatched.yaml   # a judge run vs the runs it controls for (CPU)
     python -m sts.cli datasets
 
 Every run is fully described by its YAML file; the flags below only exist to
@@ -201,6 +202,27 @@ def command_fuse(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_compare(args: argparse.Namespace) -> int:
+    """The config's judge against the runs under `comparison:`, pair by pair (no model loaded)."""
+    from .comparison import run_comparison
+
+    config = _config_from(args)
+    if config.comparison is None:
+        _log.error("%s has no `comparison:` section.", config.source_path)
+        return 1
+    if args.bootstrap is not None:
+        config.comparison.bootstrap = args.bootstrap
+    try:
+        result = run_comparison(config)
+    except (FileNotFoundError, ValueError) as exc:
+        # A missing or mismatched run: the message names the file and the fix.
+        _log.error("%s", exc)
+        return 2
+    print("\n" + result["md"].read_text(encoding="utf-8"))
+    print(f"  comparison  {result['md']}  (+ .csv, .json)\n")
+    return 0
+
+
 def command_report(args: argparse.Namespace) -> int:
     """Rebuild metrics and the summary from prediction CSVs already on disk.
 
@@ -246,10 +268,16 @@ def command_breakdown(args: argparse.Namespace) -> int:
     from .breakdown import run_breakdown
 
     config = _config_from(args)
+    baselines, baseline_models = args.baseline or [], args.baseline_models
+    if not baselines and config.comparison is not None:
+        # A config that names the runs it controls for (E2) is broken down next to them.
+        sources = list(config.comparison.references.values())
+        baselines = list(dict.fromkeys(source.output_dir for source in sources))
+        baseline_models = baseline_models or [source.model for source in sources]
     written = run_breakdown(
         config, config.datasets,
-        baselines=args.baseline or [],
-        baseline_models=args.baseline_models,
+        baselines=baselines,
+        baseline_models=baseline_models,
         label_column=args.label_column,
         per_label=args.worst,
     )
@@ -386,7 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(breakdown_parser)
     breakdown_parser.add_argument("--baseline", type=Path, action="append", default=None,
                                   help="another experiment's output dir; its predictions/<model>/ "
-                                       "files are compared too (repeatable)")
+                                       "files are compared too (repeatable; default: the runs under "
+                                       "the config's `comparison:`, if any)")
     breakdown_parser.add_argument("--baseline-models", nargs="+", default=None,
                                   help="only these model keys from the --baseline dirs")
     breakdown_parser.add_argument("--label-column", default="entailment_label",
@@ -428,6 +457,15 @@ def build_parser() -> argparse.ArgumentParser:
     fuse_parser.add_argument("--bootstrap", type=int, default=None,
                              help="paired-bootstrap resamples for the gain over text (overrides fusion.bootstrap)")
     fuse_parser.set_defaults(func=command_fuse)
+
+    compare_parser = subparsers.add_parser(
+        "compare", help="the config's judge against the runs under `comparison:` on the same pairs: "
+                        "paired-bootstrap differences, score shifts, image following (CPU, no model loaded)"
+    )
+    _add_common(compare_parser)
+    compare_parser.add_argument("--bootstrap", type=int, default=None,
+                                help="paired-bootstrap resamples per difference (overrides comparison.bootstrap)")
+    compare_parser.set_defaults(func=command_compare)
 
     datasets_parser = subparsers.add_parser("datasets", help="list the registered datasets")
     datasets_parser.set_defaults(func=command_datasets)

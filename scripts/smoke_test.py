@@ -5,6 +5,7 @@
     python scripts/smoke_test.py --config configs/llm_judge_smoke.yaml --judge   # LLM judge
     python scripts/smoke_test.py --config configs/d1_smoke.yaml --d1          # D1: images
     python scripts/smoke_test.py --config configs/d2_smoke.yaml --d2          # D2: text + images
+    python scripts/smoke_test.py --config configs/e2_smoke.yaml --e2          # E2: text + other pairs' images
 
 What it proves, in order:
 
@@ -26,7 +27,9 @@ on the generated images — and three more checks apply: every sentence has an
 image, a second ``imagine`` generates nothing, and no sentence text reaches an
 image-only prompt while both images do. ``--d2`` runs ``imagine`` and ``judge``
 with the same image checks, except that a text + image prompt must carry both
-sentences, in order and ahead of the two images.
+sentences, in order and ahead of the two images. ``--e2`` is ``--d2`` plus the
+donor assignment: within each dataset a permutation in which no pair is shown
+its own images or those of a pair sharing a sentence, identical across runs.
 
 Exit code is 0 only if everything passed.
 """
@@ -201,7 +204,7 @@ def image_checks(config, output_dir: Path, warm_generated: Optional[int]) -> Lis
         """(file name, rendered prompt, sentence1, sentence2) of every prompt dumped for a set."""
         for dump in sorted((output_dir / "prompts").glob(f"*__{prompt_set}__*.md")):
             text = dump.read_text(encoding="utf-8")
-            pair_id = re.search(r"pair `([^`]+)`", text).group(1)
+            pair_id = re.search(r"Rendered example \(pair `([^`]+)`\)", text).group(1)
             pairs = pd.read_csv(output_dir / "pairs" / f"{pair_id.rsplit('-', 1)[0]}.csv").set_index("pair_id")
             rendered = text.split("exactly as tokenised", 1)[1]
             yield dump.name, rendered, str(pairs.loc[pair_id, "sentence1"]), str(pairs.loc[pair_id, "sentence2"])
@@ -271,6 +274,39 @@ def image_checks(config, output_dir: Path, warm_generated: Optional[int]) -> Lis
     return results
 
 
+def mismatch_checks(config, output_dir: Path) -> List[CheckResult]:
+    """E2: every pair was shown an unrelated pair's images, each pair's images exactly once."""
+    problems, n_pairs, n_files = [], 0, 0
+    for judge in (j for j in config.enabled_judges if j.images_from == "other-pair"):
+        for path in sorted((output_dir / "predictions" / judge.key).glob("*.csv")):
+            n_files += 1
+            frame = pd.read_csv(path)
+            name = f"{judge.key}/{path.name}"
+            if "donor_pair_id" not in frame:
+                problems.append(f"{name}: no donor columns")
+                continue
+            pairs = pd.read_csv(output_dir / "pairs" / path.name).set_index("pair_id")
+            own, donor = frame["pair_id"], frame["donor_pair_id"]
+            n_pairs += len(frame)
+            if (own == donor).any():
+                problems.append(f"{name}: {int((own == donor).sum())} pair(s) shown their own images")
+            if sorted(own) != sorted(donor):
+                problems.append(f"{name}: the donors are not a permutation of the pairs")
+                continue
+            sentences = pairs[["sentence1", "sentence2"]].astype(str)
+            shared = sum(bool(set(sentences.loc[a]) & set(sentences.loc[b])) for a, b in zip(own, donor))
+            if shared:
+                problems.append(f"{name}: {shared} pair(s) share a sentence with their donor")
+            if not np.allclose(frame["donor_gold_score"], pairs.loc[donor, "gold_score"]):
+                problems.append(f"{name}: donor_gold_score is not the donor's gold score")
+    return [CheckResult(
+        name="mismatched_images_are_a_derangement_of_unrelated_pairs",
+        passed=not problems and n_files > 0,
+        detail=f"{n_pairs} pairs in {n_files} file(s): every pair shown another, unrelated pair's images, "
+               "each pair's images once" if not problems else "; ".join(problems),
+    )]
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", "-c", type=Path, default=REPO_ROOT / "configs" / "smoke.yaml")
@@ -286,16 +322,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="smoke-test condition D1: `imagine`, then `run` and `judge` on the generated images")
     parser.add_argument("--d2", action="store_true",
                         help="smoke-test condition D2: `imagine`, then `judge` on the sentences and their images")
+    parser.add_argument("--e2", action="store_true",
+                        help="smoke-test condition E2: `imagine`, then `judge` on the sentences and another "
+                             "pair's images")
     args = parser.parse_args(argv)
-    if args.judge + args.d1 + args.d2 > 1:
-        parser.error("--d1 and --d2 already cover the judge; pass one of --judge / --d1 / --d2")
+    if args.judge + args.d1 + args.d2 + args.e2 > 1:
+        parser.error("--d1, --d2 and --e2 already cover the judge; pass one of --judge / --d1 / --d2 / --e2")
+    imaged = args.d1 or args.d2 or args.e2
     if args.d1:
         stages = ["imagine", "run", "judge"]
-    elif args.d2:
+    elif args.d2 or args.e2:
         stages = ["imagine", "judge"]
     else:
         stages = ["judge" if args.judge else "run"]
-    judged = args.judge or args.d2
+    judged = args.judge or args.d2 or args.e2
 
     config = load_config(args.config, overrides={
         "models": args.models, "device": args.device, "data_root": args.data_root,
@@ -326,7 +366,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             for directory in config.runtime.cache_dir.glob(f"{key}__*"):
                 shutil.rmtree(directory, ignore_errors=True)
         generator = config.images.generator
-        if (args.d1 or args.d2) and generator is not None and generator.backend == "render-text":
+        if imaged and generator is not None and generator.backend == "render-text":
             # Only the model-free stand-in's images are cheap enough to throw
             # away; a real generator's store is shared with the full run.
             from sts.images.store import open_image_store
@@ -398,6 +438,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         delta = (cold_frame[column].fillna(-999.0) - warm_frame[column].fillna(-999.0)).abs().max()
         if delta > 0:
             mismatches.append(f"{name}: max |Δ{column}| = {delta:.3e}")
+        if "donor_pair_id" in cold_frame and not cold_frame["donor_pair_id"].equals(warm_frame["donor_pair_id"]):
+            mismatches.append(f"{name}: different donor pairs")
     extra_checks.append(CheckResult(
         name="rerun_reproduces_identical_predictions",
         passed=not mismatches,
@@ -414,8 +456,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     checks = run_validation(config, encoder_checks=not judged, sample=16)
     if judged or args.d1:
         checks.extend(judge_checks(output_dir))
-    if args.d1 or args.d2:
+    if imaged:
         checks.extend(image_checks(config, output_dir, warm_generated))
+    if args.e2:
+        checks.extend(mismatch_checks(config, output_dir))
 
     # ---- 5. single-command reproduction ------------------------------------
     reproduce = " && ".join(f"python -m sts.cli {stage} --config {args.config}" for stage in stages)

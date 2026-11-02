@@ -134,6 +134,19 @@ CONDITION_TEXT = {
         "Nothing is trained, calibrated or tuned on any split. Generator and image settings are "
         "in the Models table.",
     ),
+    "E2": (
+        "E2: sentence pair + mismatched images",
+        "D2's vision-language judge and prompt, verbatim: the sentence pair, then two generated images "
+        "introduced as the images of those sentences. Every pair, however, is shown the two images "
+        "generated for another pair of the same dataset, assigned by a seeded random derangement: each "
+        "pair's images are shown exactly once, never with their own pair or with a pair sharing a "
+        "sentence (or, in CxC, a COCO image). The prompt text is D2's to the byte, so E2 differs from D2 "
+        "only in which images accompany the sentences: a judge that reads its images scores E2 below "
+        "D2, one that ignores them scores both alike. Prediction rows name the pair whose images were "
+        "shown (`donor_pair_id`) and its gold score; `sts.cli compare` sets E2 against D2 and B1 on the "
+        "same pairs. Nothing is trained, calibrated or tuned on any split. Generator and image settings "
+        "are in the Models table.",
+    ),
     "LF": (
         "LF: late fusion of text and image scores",
         "Per pair, fused = alpha * text + (1 - alpha) * image, from the per-pair predictions of "
@@ -327,7 +340,8 @@ def build_markdown_summary(
         commands = [f"python -m sts.cli fuse --config {config.source_path}"]
     elif config.images.generator is not None:
         steps = ["imagine", *(["run"] if config.enabled_models else []),
-                 *(["judge"] if config.enabled_judges else []), "report"]
+                 *(["judge"] if config.enabled_judges else []), "report",
+                 *(["compare"] if config.comparison is not None else [])]
         commands = [f"python -m sts.cli {step} --config {config.source_path}" for step in steps]
     else:
         commands = [f"python -m sts.cli {'judge' if method == 'judge' else 'run'} --config {config.source_path}"]

@@ -1,0 +1,130 @@
+# =============================================================================
+# Condition E2: sentence pair + mismatched images.
+#
+# Did the D2 judge actually use its images? E2 runs D2's judge with D2's
+# prompt, unchanged, but shows every sentence pair the two images generated
+# for ANOTHER pair of the same dataset (a seeded random derangement; see
+# sts/judge/mismatch.py). The prompt still says the images were generated from
+# the sentences: only the pixels differ from D2. A judge that reads its images
+# loses correlation here; one that ignores them scores every pair as D2 did.
+#
+# Stages (each resumable; TSUBAME: tsubame/job_e2.sh):
+#   python -m sts.cli judge   --config configs/e2_mismatched.yaml  # 1. VLM judge, pair + another pair's images
+#   python -m sts.cli report  --config configs/e2_mismatched.yaml
+#   python -m sts.cli compare --config configs/e2_mismatched.yaml  # 2. vs D2 and B1, pair by pair (CPU)
+#   python -m sts.cli breakdown --config configs/e2_mismatched.yaml \
+#       --datasets sick-all sick-test cxc-val cxc-test             #    the same, by category (CPU)
+#
+# No imagine stage: the images block is D1's (and D2's), setting for setting,
+# so E2 reads D1's store, complete once D1's full imagine has run.
+# =============================================================================
+
+experiment:
+  name: e2_mismatched
+  condition: E2
+  output_dir: outputs/e2_mismatched
+  seed: 42
+  resume: true
+
+data:
+  root: data/raw
+  sick_path: data/raw/sick/SICK.txt
+  cxc_dir: data/raw/cxc/data
+  coco_karpathy_json: data/raw/coco_karpathy/dataset_coco.json
+  sts3k_path: data/raw/sts3k/STS3k_all.txt
+
+datasets:
+  - cxc-val
+  - cxc-test
+  - sick-test
+  - sick-all
+  - sts3k
+
+runtime:
+  device: auto
+  dtype: auto               # bfloat16 on cuda
+  batch_size: 16
+  max_length: 512           # text-encoder setting; unused by the judge
+  # Judgment cache. Keys are the sentence pair plus the two donor sentences,
+  # and the fingerprint carries images_from, so nothing mixes with D2's.
+  cache_dir: .cache/e2
+  use_cache: true
+  flush_every: 512          # pairs between cache flushes
+  progress: true
+  seed: 42
+
+# -----------------------------------------------------------------------------
+# The images: identical to configs/d1_image_only.yaml (see the comments there).
+# -----------------------------------------------------------------------------
+images:
+  store_dir: .cache/images    # on TSUBAME pass the group-storage store D1 used (STS_IMAGE_DIR)
+  flush_every: 512
+  preview_pairs: 4
+  generator:
+    key: flux2-klein-4b
+    model_id: /gs/fs/tga-kiban-arase/zhu/models/FLUX.2-klein-4B
+    backend: flux2-klein
+    height: 1024
+    width: 1024
+    num_inference_steps: 4
+    guidance_scale: 1.0
+    max_sequence_length: 512
+    seed: 0
+    seed_policy: shared
+    dtype: bfloat16
+    batch_size: 8
+    image_format: jpeg
+    jpeg_quality: 95
+
+models: []
+
+# -----------------------------------------------------------------------------
+# The judge: configs/d2_text_image.yaml's, setting for setting, plus
+# images_from: other-pair.
+#
+# Per dataset, a random derangement drawn from mismatch_seed and the dataset
+# name gives every pair a donor: every pair's two images are shown exactly
+# once, never with their own pair, nor with a pair that shares a sentence or
+# (CxC) a COCO image. Each dataset is deranged on its own, so sick-all's 4,906
+# test pairs get other donors than in sick-test and are judged again: ~107k
+# prompts in all against D2's ~102k, each as long as D2's.
+# -----------------------------------------------------------------------------
+judges:
+  - key: e2-qwen3.5-35b-a3b
+    model_id: /gs/fs/tga-kiban-arase/zhu/models/Qwen3.5-35B-A3B
+    backend: hf
+    prompt_set: text-image-v1     # D2's prompt, so D2's prompt_hash
+    input: text+image
+    images_from: other-pair       # the two images generated for another pair
+    mismatch_seed: 0
+    image_size: 512
+    enable_thinking: false        # hard requirement: no CoT
+    symmetrize: false
+    symmetry_check_sample: 256    # pairs re-scored with sentences (and the images shown for them) swapped
+    min_valid_mass: 0.05
+    batch_size: 8                 # pairs (16 images) per forward pass
+    max_prompt_tokens: 4096       # flagged if exceeded; never truncated
+    trust_remote_code: false
+    enabled: true
+    notes: "E2 judge: the D2 judge and prompt, each pair shown another pair's generated images."
+
+# -----------------------------------------------------------------------------
+# What `compare` (and `breakdown` without --baseline) sets E2 against, on the
+# pairs E2 scored. The output_dir paths are where the TSUBAME jobs wrote by
+# default; change one if that run went elsewhere.
+# -----------------------------------------------------------------------------
+comparison:
+  matched:  {output_dir: outputs/d2_text_image/full, model: d2-qwen3.5-35b-a3b}   # D2: each pair's own images
+  no_image: {output_dir: outputs/llm_judge/full, model: qwen3.5-35b-a3b}         # B1: the sentence pair alone
+  bootstrap: 1000                                                                 # paired resamples per difference
+
+metrics:
+  bootstrap: 0
+  bootstrap_seed: 12345
+  confidence: 0.95
+  report_domains: true
+  macro_average_over:
+    - cxc-val
+    - cxc-test
+    - sick-test
+    - sts3k

@@ -24,6 +24,11 @@ sentences — alone, or after the sentence pair — with the matching prompt set
 pair — each sentence names its image — and the image store's hash joins the
 cache fingerprint. The order-symmetry check then swaps the sentences and their
 images together.
+
+A judge with ``images_from: other-pair`` (condition E2) renders the D2 prompt
+with the two images of another pair of the dataset, its donor
+(:mod:`~sts.judge.mismatch`). The donor's two sentences then join the cache
+key, and every prediction row names the donor.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -43,6 +48,7 @@ from ..images.store import ImageStore, open_image_store
 from ..manifest import Manifest
 from ..metrics import compute_correlations
 from ..pipeline import RunPaths, metric_rows, set_global_seed
+from .mismatch import DonorAssignment, assign_donors
 from .prompts import PromptSpec, family_of, get_prompt, input_of
 from .scorer import LLMJudge, ScoreBatch
 
@@ -53,9 +59,23 @@ PREDICTION_COLUMN = "expected_score"
 #: swapped order is a different prompt and gets its own row.
 _PAIR_SEPARATOR = "\x1f"
 
+#: Per pair, the two sentences whose generated images fill the image slots,
+#: when they are not the pair's own (E2): (slot-one sentences, slot-two sentences).
+ImageSentences = Tuple[Sequence[str], Sequence[str]]
 
-def _pair_keys(sentence_a: Sequence[str], sentence_b: Sequence[str]) -> List[str]:
-    return [f"{a}{_PAIR_SEPARATOR}{b}" for a, b in zip(sentence_a, sentence_b)]
+
+def _pair_keys(
+    sentence_a: Sequence[str], sentence_b: Sequence[str], images: Optional[ImageSentences] = None
+) -> List[str]:
+    if images is None:
+        return [f"{a}{_PAIR_SEPARATOR}{b}" for a, b in zip(sentence_a, sentence_b)]
+    # Another pair's images make another prompt: their sentences join the key.
+    return [_PAIR_SEPARATOR.join(parts) for parts in zip(sentence_a, sentence_b, *images)]
+
+
+def _swapped(images: Optional[ImageSentences]) -> Optional[ImageSentences]:
+    """The image slots of the swapped order: the images move with their sentences."""
+    return None if images is None else (images[1], images[0])
 
 
 def build_judge(
@@ -86,21 +106,30 @@ def score_pairs_cached(
     sentence_a: Sequence[str],
     sentence_b: Sequence[str],
     flush_every: int,
+    images: Optional[ImageSentences] = None,
 ) -> ScoreBatch:
     """Judge every (a, b) pair, consulting and filling the cache.
 
+    ``images`` fills each pair's image slots with other sentences' images (E2);
+    by default a pair is shown its own.
+
     Cached row layout: ``[p(digit) for each scale value, space_mass, prompt_tokens]``.
     """
-    keys = _pair_keys(sentence_a, sentence_b)
+    keys = _pair_keys(sentence_a, sentence_b, images)
     k = len(spec.scale)
     matrix, missing = cache.lookup(keys)
+
+    def render(i: int):
+        if images is None:
+            return judge.render(spec, sentence_a[i], sentence_b[i])
+        return judge.render(spec, sentence_a[i], sentence_b[i], images=(images[0][i], images[1][i]))
 
     if missing:
         _log.info("  cache: %d/%d pairs hit, judging %d", len(keys) - len(missing), len(keys), len(missing))
         computed: List[np.ndarray] = []
         for start in range(0, len(missing), flush_every):
             positions = missing[start : start + flush_every]
-            prompts = [judge.render(spec, sentence_a[i], sentence_b[i]) for i in positions]
+            prompts = [render(i) for i in positions]
             batch = judge.score(prompts, spec.scale)
             rows = np.concatenate(
                 [batch.raw_probs, batch.space_mass[:, None], batch.prompt_tokens[:, None].astype(np.float64)],
@@ -141,6 +170,7 @@ def build_predictions(
     forward: ScoreBatch,
     reverse: Optional[ScoreBatch],
     store: Optional[ImageStore] = None,
+    donors: Optional[DonorAssignment] = None,
 ) -> pd.DataFrame:
     frame = dataset.to_dataframe()
     scale = spec.scale
@@ -194,6 +224,9 @@ def build_predictions(
             "image_store": store.fingerprint_hash,
             "generator": store.generator_key,
         })
+    if donors is not None:
+        # E2: the images were another pair's; name it.
+        columns.update(donors.columns())
     return pd.DataFrame(columns)
 
 
@@ -245,11 +278,13 @@ def symmetry_check(
     seed: int,
     flush_every: int,
     min_valid_mass: float,
+    images: Optional[ImageSentences] = None,
 ) -> Dict[str, object]:
     """Re-score a sample with the sentences swapped and measure the disagreement.
 
     A symmetric prompt does not make an LLM order-invariant; this quantifies
-    how far from invariant the judge actually is on this dataset.
+    how far from invariant the judge actually is on this dataset. ``images``
+    (E2), aligned with the dataset's pairs, swap along with the sentences.
     """
     n = min(sample, len(dataset))
     if n < 2:
@@ -258,7 +293,8 @@ def symmetry_check(
     index = np.sort(rng.choice(len(dataset), size=n, replace=False))
     s1 = [dataset.pairs[i].sentence1 for i in index]
     s2 = [dataset.pairs[i].sentence2 for i in index]
-    reverse = score_pairs_cached(judge, spec, cache, s2, s1, flush_every)
+    sampled = None if images is None else tuple([slot[i] for i in index] for slot in images)
+    reverse = score_pairs_cached(judge, spec, cache, s2, s1, flush_every, _swapped(sampled))
     e_rev = reverse.expected(spec.scale, min_valid_mass)
     e_fwd = forward_expected[index]
     a, b, n_ok = _finite_pair(e_fwd, e_rev)
@@ -277,7 +313,12 @@ def symmetry_check(
 
 
 def dump_prompt(
-    output_dir: Path, spec: PromptSpec, judge: LLMJudge, prompt_hash: str, example: STSDataset
+    output_dir: Path,
+    spec: PromptSpec,
+    judge: LLMJudge,
+    prompt_hash: str,
+    example: STSDataset,
+    donors: Optional[DonorAssignment] = None,
 ) -> Path:
     """Write the spec and one fully rendered prompt so a hash can be traced back."""
     directory = output_dir / "prompts"
@@ -286,18 +327,29 @@ def dump_prompt(
     if path.exists():
         return path
     pair = example.pairs[0]
-    rendered = judge.render(spec, pair.sentence1, pair.sentence2)
+    if donors is None:
+        rendered = judge.render(spec, pair.sentence1, pair.sentence2)
+    else:
+        donor = donors.pair_of(0)
+        rendered = judge.render(spec, pair.sentence1, pair.sentence2, images=(donor.sentence1, donor.sentence2))
     images = getattr(rendered, "images", None)
     rendered = getattr(rendered, "text", rendered)
     image_lines = []
     if images:
         store = f"(store `{judge.store.directory.name}`)"
-        image_lines = [
-            f"- input: the two sentences, then the images generated from them {store}"
-            if input_of(spec) == "text+image" else
-            f"- input: images generated from the two sentences {store}; "
-            "the sentences themselves are not in the prompt",
-        ]
+        if donors is not None:
+            image_lines = [
+                f"- input: the two sentences, then the two images generated for another pair of the "
+                f"dataset, `{donor.pair_id}` ({donor.sentence1!r} / {donor.sentence2!r}) {store}; "
+                f"donors drawn with mismatch_seed {donors.seed}",
+            ]
+        elif input_of(spec) == "text+image":
+            image_lines = [f"- input: the two sentences, then the images generated from them {store}"]
+        else:
+            image_lines = [
+                f"- input: images generated from the two sentences {store}; "
+                "the sentences themselves are not in the prompt",
+            ]
     body = "\n".join([
         f"# Prompt {spec.family} {spec.version}",
         "",
@@ -381,6 +433,10 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
                     _log.info("[%s | %s] resume: reusing %s", judge_spec.key, name, output_path)
                     predictions = pd.read_csv(output_path)
                 else:
+                    donors: Optional[DonorAssignment] = None
+                    if judge_spec.images_from == "other-pair":
+                        donors = assign_donors(dataset, judge_spec.mismatch_seed)
+                    images = donors.images if donors is not None else None
                     if reads_images(judge_spec.input):
                         # Fail before loading ~70 GB of weights, with the command that fixes it.
                         store.require(dataset.unique_texts(), purpose=f"{judge_spec.key} on {name}")
@@ -395,6 +451,8 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
                             "prompt_set": judge_spec.prompt_set,
                             "symmetrize": judge_spec.symmetrize,
                             "min_valid_mass": judge_spec.min_valid_mass,
+                            **({"images_from": judge_spec.images_from, "mismatch_seed": judge_spec.mismatch_seed}
+                               if judge_spec.images_from != "own" else {}),
                         })
                     prompt_hash = judge.prompt_hash(spec)
                     family = family_of(name)
@@ -414,28 +472,33 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
                             enabled=config.runtime.use_cache,
                         )
                     cache = caches[family]
-                    prompt_file = dump_prompt(config.output_dir, spec, judge, prompt_hash, dataset)
+                    prompt_file = dump_prompt(config.output_dir, spec, judge, prompt_hash, dataset, donors)
 
                     _log.info("[%s | %s] %d pairs, prompt %s (%s), scale %s",
                               judge_spec.key, name, len(dataset), spec.version, prompt_hash[:12], list(spec.scale))
+                    if donors is not None:
+                        _log.info("[%s | %s] images of other pairs (mismatch_seed %d): ρ(gold, donor gold) = %+.4f",
+                                  judge_spec.key, name, donors.seed,
+                                  compute_correlations(dataset.gold, dataset.gold[donors.donor]).spearman)
                     started = time.time()
                     forward = score_pairs_cached(
-                        judge, spec, cache, dataset.sentence1, dataset.sentence2, config.runtime.flush_every
+                        judge, spec, cache, dataset.sentence1, dataset.sentence2, config.runtime.flush_every, images
                     )
                     reverse = None
                     if judge_spec.symmetrize:
                         reverse = score_pairs_cached(
-                            judge, spec, cache, dataset.sentence2, dataset.sentence1, config.runtime.flush_every
+                            judge, spec, cache, dataset.sentence2, dataset.sentence1, config.runtime.flush_every,
+                            _swapped(images),
                         )
                     predictions = build_predictions(
-                        dataset, judge_spec, spec, prompt_hash, forward, reverse, store
+                        dataset, judge_spec, spec, prompt_hash, forward, reverse, store, donors
                     )
 
                     symmetry = symmetry_check(
                         judge, spec, cache, dataset,
                         forward.expected(spec.scale, judge_spec.min_valid_mass),
                         judge_spec.symmetry_check_sample, config.runtime.seed,
-                        config.runtime.flush_every, judge_spec.min_valid_mass,
+                        config.runtime.flush_every, judge_spec.min_valid_mass, images,
                     ) if judge_spec.symmetry_check_sample and not judge_spec.symmetrize else {"n": 0}
                     elapsed = time.time() - started
 
@@ -463,6 +526,8 @@ def run_judge_experiment(config: ExperimentConfig) -> pd.DataFrame:
                         "symmetrized": judge_spec.symmetrize,
                         "answer": diagnostics,
                         "symmetry_check": symmetry,
+                        **({"mismatch": donors.diagnostics(predictions[PREDICTION_COLUMN].to_numpy(np.float64))}
+                           if donors is not None else {}),
                     })
                     _log.info("[%s | %s] done in %.1fs | ρ expected=%.4f argmax=%.4f | mass median=%.3f "
                               "| degenerate=%d | order Δ=%.3f -> %s",
