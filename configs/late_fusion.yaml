@@ -2,7 +2,9 @@
 # Condition LF: late fusion of finished text and image runs.
 #
 #   python -m sts.cli fuse --config configs/late_fusion.yaml     # CPU, no model loaded
-#   (TSUBAME: qsub ... tsubame/job_fusion.sh)
+#   python -m sts.cli breakdown --config configs/late_fusion.yaml \
+#       --datasets sick-all sick-test cxc-val cxc-test           # the fused systems by category
+#   (TSUBAME: qsub ... tsubame/job_fusion.sh runs both)
 #
 # Per pair: fused = alpha * norm(text score) + (1 - alpha) * norm(image score),
 # read from the predictions/<model>/<dataset>.csv files the runs below already

@@ -385,9 +385,10 @@ the main README explains how to read it.
 ## Late fusion (LF): CPU job
 
 `job_fusion.sh` runs `python -m sts.cli fuse --config configs/late_fusion.yaml`
-(main README, "Late fusion"). It reads the per-pair predictions of finished
-runs and loads no model: under a minute and ~1.5 GB on the full datasets, so the
-smallest CPU allocation is enough.
+(main README, "Late fusion"), then `sts.cli breakdown` on the fused systems:
+SICK by NLI label, CxC by `sampling_method`. Both read per-pair predictions and
+load no model: about a minute and ~1.5 GB on the full datasets, so the smallest
+CPU allocation is enough.
 
 ```bash
 qsub -g <group> -l <cpu resource>=1 -v STS_PYTHON="$(command -v python)" tsubame/job_fusion.sh
@@ -398,8 +399,18 @@ The sources are the default output directories of the earlier jobs:
 `outputs/d1_image_only/full` (D1 embed + judge). If a run wrote elsewhere, edit
 its `output_dir` in `configs/late_fusion.yaml`. The job stops before writing
 anything and lists every missing prediction file. `STS_FUSION_SYSTEMS="lf-judge"`
-runs one fused pair only; `bash tsubame/job_fusion.sh --help` lists the rest.
-Results land in `outputs/late_fusion/`; start with `fusion_comparison.md`.
+runs one fused pair only, in both steps; `STS_BREAKDOWN_DATASETS` picks the
+datasets to break down (default `sick-all sick-test cxc-val cxc-test`; STS3k has
+no categories). `bash tsubame/job_fusion.sh --help` lists the rest.
+
+Results land in `outputs/late_fusion/`; start with `fusion_comparison.md`, then
+`breakdown/<dataset>__<label>.md`, which sets each fused pair's `-text`,
+`-image`, `-a0.5` and `-dev` side by side (`-text` and `-image` are the two
+sources on the same pairs). cxc-val and sick-all are where α is chosen and have
+no `-dev`, so the log warns that its predictions are missing there. Fused scores
+are z-scores: their `pred_mean` is in standard deviations, and the judge-vs-gold
+table leaves them out. α and the normalisation are the whole dataset's; nothing
+is chosen per category.
 
 ## Run (embedding)
 

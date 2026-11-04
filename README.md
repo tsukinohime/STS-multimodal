@@ -590,11 +590,14 @@ model looking at the text and at the images:
   `image_score`; the manifest records the chosen α per dataset and the sha256
   of every source file.
 * *By category.* `report` and `breakdown` read the fused predictions like any
-  others, e.g. SICK by NLI label:
-  `python -m sts.cli breakdown --config configs/late_fusion.yaml --datasets sick-test sick-all`.
+  others. The TSUBAME job runs the breakdown right after `fuse` (SICK by NLI
+  label, CxC by `sampling_method`); by hand:
+  `python -m sts.cli breakdown --config configs/late_fusion.yaml --datasets sick-all sick-test cxc-val cxc-test`.
+  α and the normalisation stay those of the whole dataset; nothing is chosen
+  per category.
 
-On TSUBAME, `tsubame/job_fusion.sh` runs it as a CPU job; see
-[tsubame/README.md](tsubame/README.md#late-fusion-lf-cpu-job).
+On TSUBAME, `tsubame/job_fusion.sh` runs `fuse` and then the breakdown as one
+CPU job; see [tsubame/README.md](tsubame/README.md#late-fusion-lf-cpu-job).
 
 ## Outputs
 
