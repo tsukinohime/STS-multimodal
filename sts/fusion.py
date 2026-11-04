@@ -13,7 +13,7 @@ weighs the two sources rather than their spreads (an image cosine varies far
 less than a text cosine); ``rank`` uses fractional ranks; ``none`` keeps the
 raw scores.
 
-**Alpha** is read three ways in one run:
+**Alpha** is read three ways in one run, four with ``category_alpha``:
 
 * *sweep*: every alpha of the grid on every dataset and dev set
   (``alpha_sweep.csv``), the curve from image only (0) to text only (1). An
@@ -24,6 +24,15 @@ raw scores.
   overlap the evaluation pairs, and no test split's gold scores enter a choice:
   CxC test from CxC val, SICK test from SICK train + trial, STS3k (no dev split
   of its own) from both.
+* *per category* (``category_alpha``): the same choice once per category (SICK:
+  NLI label; CxC: ``sampling_method``), each alpha scored by the Spearman
+  *within* that category on its dev pairs, every dev set still normalised as a
+  whole. Each evaluation pair then gets the alpha of its category. A dataset
+  without categories (STS3k), and a category no dev set can score, keep the
+  *dev* alpha. ``-cat`` reads every evaluation pair's category, which for SICK
+  is gold NLI annotation: it is an analysis next to ``-dev``, not a label-free
+  method. Whole-dataset normalisation keeps the categories on one scale, and
+  the sweep adds each category's curve.
 
 **Pairs.** All systems of one fused pair are scored on the same pairs: those
 both sources scored (a judge's degenerate answers have no score; they are
@@ -37,12 +46,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
+from .breakdown import pair_labels
 from .config import DevSet, ExperimentConfig, FusionConfig, FusionSource, FusionSystem, get_logger
 from .data import STSDataset, load_dataset
 from .hashing import sha256_file
@@ -56,7 +66,7 @@ FUSED_COLUMN = "fused_score"
 #: Per-pair columns copied from the text source into every fused prediction file.
 _CARRIED = ("dataset", "split", "domain", "gold_score", "sentence1_id", "sentence2_id", "image1_id", "image2_id")
 #: Roles of the systems one fused pair writes, in report order.
-ROLES = ("text", "image", "fixed", "dev")
+ROLES = ("text", "image", "fixed", "dev", "cat")
 
 
 # --------------------------------------------------------------------------- #
@@ -196,14 +206,22 @@ def build_dev_sets(
 # Choosing alpha, and the paired comparison
 # --------------------------------------------------------------------------- #
 def select_alpha(
-    devs: Sequence[Joined], alphas: Sequence[float], normalization: str
+    devs: Sequence[Joined],
+    alphas: Sequence[float],
+    normalization: str,
+    within: Optional[Sequence[np.ndarray]] = None,
 ) -> Tuple[float, List[Dict[str, float]]]:
-    """The alpha with the best mean Spearman over ``devs``; ties go to the larger alpha (more text)."""
+    """The alpha with the best mean Spearman over ``devs``; ties go to the larger alpha (more text).
+
+    ``within`` scores each dev set on a subset of its scored pairs (one
+    category); the normalisation still covers the whole dev set.
+    """
     normalised = [dev.normalised(normalization) for dev in devs]
+    masks = within if within is not None else [np.ones(dev.gold.size, dtype=bool) for dev in devs]
     table: List[Dict[str, float]] = []
     for alpha in alphas:
-        rhos = [compute_correlations(fuse(t, i, alpha), dev.gold).spearman
-                for dev, (t, i) in zip(devs, normalised)]
+        rhos = [compute_correlations(fuse(t, i, alpha)[mask], dev.gold[mask]).spearman
+                for dev, (t, i), mask in zip(devs, normalised, masks)]
         table.append({"alpha": alpha, "dev_spearman": float(np.mean(rhos)),
                       **{dev.name: float(rho) for dev, rho in zip(devs, rhos)}})
     finite = [row for row in table if np.isfinite(row["dev_spearman"])]
@@ -211,6 +229,39 @@ def select_alpha(
         raise ValueError(f"no alpha gives a finite Spearman on {[d.name for d in devs]}")
     best = max(finite, key=lambda row: (row["dev_spearman"], row["alpha"]))
     return float(best["alpha"]), table
+
+
+def select_category_alphas(
+    devs: Sequence[Joined],
+    dev_labels: Sequence[np.ndarray],
+    categories: Sequence[str],
+    alphas: Sequence[float],
+    normalization: str,
+    fallback: float,
+) -> Dict[str, Dict[str, object]]:
+    """Per category, :func:`select_alpha` scored within that category's dev pairs.
+
+    ``dev_labels`` gives the category of each dev set's scored pairs. A category
+    that no dev set has two pairs of, or that no alpha scores finitely, keeps
+    ``fallback`` (the dataset-level alpha), and its record says so.
+    """
+    chosen: Dict[str, Dict[str, object]] = {}
+    for category in categories:
+        members = [(dev, labels == category) for dev, labels in zip(devs, dev_labels)
+                   if (labels == category).sum() >= 2]
+        record: Dict[str, object] = {"n_dev_pairs": {dev.name: int(mask.sum()) for dev, mask in members},
+                                     "alpha": fallback, "dev_spearman": float("nan"), "fallback": True}
+        if members:
+            try:
+                alpha, table = select_alpha([dev for dev, _ in members], alphas, normalization,
+                                            within=[mask for _, mask in members])
+            except ValueError:  # no alpha scores these pairs finitely
+                pass
+            else:
+                best = next(row for row in table if row["alpha"] == alpha)
+                record.update(alpha=alpha, dev_spearman=best["dev_spearman"], fallback=False)
+        chosen[category] = record
+    return chosen
 
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
@@ -265,11 +316,16 @@ def write_predictions(
     system: FusionSystem,
     data: Joined,
     scores: np.ndarray,
-    alpha: float,
+    alpha: Union[float, np.ndarray],
     alpha_source: str,
     normalization: str,
+    extra: Optional[Dict[str, object]] = None,
 ) -> pd.DataFrame:
-    """The standard prediction file; pairs a source left unscored keep a NaN score."""
+    """The standard prediction file; pairs a source left unscored keep a NaN score.
+
+    ``alpha`` is one value, or one per pair of ``data`` (``-cat``); ``extra``
+    adds columns after ``normalization``.
+    """
     frame = data.frame
     fused = np.full(len(frame), np.nan)
     fused[data.scored] = scores
@@ -284,6 +340,7 @@ def write_predictions(
         "alpha": alpha,
         "alpha_source": alpha_source,
         "normalization": normalization,
+        **(extra or {}),
         "text_score": frame["text_score"].to_numpy(),
         "image_score": frame["image_score"].to_numpy(),
         "text_system": f"{system.text.output_dir.name}/{system.text.model}",
@@ -331,6 +388,14 @@ def comparison_markdown(rows: List[Dict[str, object]], fusion: FusionConfig) -> 
         f"system minus the text-only one on the same pairs, with a {fusion.bootstrap}-resample "
         "paired-bootstrap 95% CI.",
     ]
+    if any("cat_spearman" in row for row in rows):
+        lines += [
+            "",
+            "`-cat` chooses one alpha per category the same way, scored within the category on its dev "
+            "pairs (SICK: NLI label, CxC: sampling_method), and gives every evaluation pair its "
+            "category's alpha. It reads each evaluation pair's category, which for SICK is gold "
+            "annotation: an analysis next to `-dev`, not a label-free method.",
+        ]
     for metric, name in (("spearman", "Spearman"), ("pearson", "Pearson")):
         for system in dict.fromkeys(row["system"] for row in rows):
             lines += ["", f"## {system} — {name}", ""]
@@ -349,6 +414,16 @@ def comparison_markdown(rows: List[Dict[str, object]], fusion: FusionConfig) -> 
                  "Δ vs text", "dev α (chosen on)", "dev-α", "Δ vs text"],
                 body,
             )
+            per_category = [r for r in rows if r["system"] == system and f"cat_{metric}" in r]
+            if per_category:
+                lines += ["", f"Per category (`{system}-cat`), against text only and against dev-α:", ""]
+                lines += _table(
+                    ["dataset", "pairs", "category", "α per category", "dev-α", "per-category α",
+                     "Δ vs text", "Δ vs dev-α"],
+                    [[str(r["dataset"]), str(r["n"]), str(r["cat_label"]), str(r["cat_alphas"]),
+                      _fmt(r[f"dev_{metric}"]), _fmt(r[f"cat_{metric}"]),
+                      _delta(r, "cat", metric), _delta(r, "cat_vs_dev", metric)] for r in per_category],
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -363,13 +438,19 @@ def sweep_markdown(sweep: pd.DataFrame, fusion: FusionConfig, columns: int = 11)
         f"Each source {fusion.normalization}-normalised within the set. An analysis curve: no "
         "reported number is picked from it. Dev sets are the pairs alpha is chosen on.",
     ]
+    if (sweep["category"] != "").any():
+        lines += [
+            "",
+            "A row with a category gives the Spearman within that category, the set still "
+            "normalised as a whole; on a dev set it is the curve `-cat` takes that category's alpha from.",
+        ]
     for system, group in sweep.groupby("system", sort=False):
         lines += ["", f"## {system}", ""]
         body = []
-        for (dataset, role), rows in group.groupby(["dataset", "role"], sort=False):
+        for (dataset, role, category), rows in group.groupby(["dataset", "role", "category"], sort=False):
             by_alpha = rows.set_index("alpha")["spearman"]
-            body.append([f"{dataset}{' (dev)' if role == 'dev' else ''}", str(int(rows["n"].iloc[0]))]
-                        + [_fmt(by_alpha.get(a, np.nan)) for a in shown])
+            label = f"{dataset}{' (dev)' if role == 'dev' else ''}{f' · {category}' if category else ''}"
+            body.append([label, str(int(rows["n"].iloc[0]))] + [_fmt(by_alpha.get(a, np.nan)) for a in shown])
         lines += _table(["dataset", "pairs", *(f"{a:g}" for a in shown)], body)
     return "\n".join(lines) + "\n"
 
@@ -420,6 +501,18 @@ def run_fusion(config: ExperimentConfig) -> pd.DataFrame:
     selections: Dict[str, Dict[str, object]] = {}
     sources: Dict[str, Dict[str, object]] = {}
 
+    labels_by_dataset: Dict[str, Tuple[pd.Series, str]] = {}
+
+    def categories_of(data: Joined, dataset_name: str) -> Tuple[np.ndarray, str]:
+        """The category of every pair of ``data`` (a dataset, or a dev set drawn from it) and its column."""
+        if dataset_name not in labels_by_dataset:
+            labels_by_dataset[dataset_name] = pair_labels(config, datasets[dataset_name])
+        labels, column = labels_by_dataset[dataset_name]
+        return labels.reindex(data.frame.index).to_numpy(dtype=object), column
+
+    def present(labels: np.ndarray) -> List[str]:
+        return sorted({label for label in labels if isinstance(label, str)})
+
     for system in fusion.enabled_systems:
         keys = fusion.output_keys(system)
         _log.info("[%s] text %s/%s + image %s/%s, %s-normalised", system.key,
@@ -451,15 +544,43 @@ def run_fusion(config: ExperimentConfig) -> pd.DataFrame:
             _log.info("[%s] alpha for %s = %.2f (mean dev Spearman %.4f on %s)",
                       system.key, target, chosen[target], best["dev_spearman"], ", ".join(names))
 
-        # The curve, on every evaluation dataset and every dev set that is not one of them.
+        # One alpha per category of the target, each scored within that category on the dev pairs.
+        by_category: Dict[str, Dict[str, Dict[str, object]]] = {}
+        for target in targets if fusion.category_alpha else []:
+            labels, column = categories_of(joined[target], target)
+            categories = present(labels)
+            if len(categories) < 2:
+                selections[system.key][target]["category_alphas"] = None
+                _log.info("[%s] %s has no categories: -cat keeps alpha %.2f", system.key, target, chosen[target])
+                continue
+            names = fusion.select_alpha_on[target]
+            dev_labels = [categories_of(devs[n], dev_specs[n].dataset)[0][devs[n].scored] for n in names]
+            by_category[target] = select_category_alphas(
+                [devs[n] for n in names], dev_labels, categories, fusion.alphas, fusion.normalization,
+                fallback=chosen[target],
+            )
+            selections[system.key][target].update(category_column=column, category_alphas=by_category[target])
+            _log.info("[%s] alpha per %s for %s: %s", system.key, column, target,
+                      ", ".join(f"{c} {r['alpha']:.2f}{' (dev alpha)' if r['fallback'] else ''}"
+                                for c, r in by_category[target].items()))
+
+        # The curve, on every evaluation dataset and every dev set that is not one of them,
+        # and with category_alpha also within each of their categories.
         own = [(n, d, "dev") for n, d in devs.items() if dev_specs[n].exclude or n not in config.datasets]
         for name, data, role in [*((n, joined[n], "evaluation") for n in config.datasets), *own]:
             text, image = data.normalised(fusion.normalization)
-            for alpha in fusion.alphas:
-                correlations = compute_correlations(fuse(text, image, alpha), data.gold)
-                sweep_rows.append({"system": system.key, "dataset": name, "role": role, "alpha": alpha,
-                                   "n": correlations.n, "spearman": correlations.spearman,
-                                   "pearson": correlations.pearson})
+            curves = [("", np.ones(data.gold.size, dtype=bool))]
+            if fusion.category_alpha:
+                labels = categories_of(data, name if role == "evaluation" else dev_specs[name].dataset)[0]
+                labels = labels[data.scored]
+                if len(present(labels)) > 1:
+                    curves += [(category, labels == category) for category in present(labels)]
+            for category, mask in curves:
+                for alpha in fusion.alphas:
+                    correlations = compute_correlations(fuse(text, image, alpha)[mask], data.gold[mask])
+                    sweep_rows.append({"system": system.key, "dataset": name, "role": role, "category": category,
+                                       "alpha": alpha, "n": correlations.n, "spearman": correlations.spearman,
+                                       "pearson": correlations.pearson})
 
         for name in config.datasets:
             started = time.time()
@@ -468,10 +589,21 @@ def run_fusion(config: ExperimentConfig) -> pd.DataFrame:
             scores = {"text": text, "image": image, "fixed": fuse(text, image, fusion.fixed_alpha)}
             alphas = {"text": 1.0, "image": 0.0, "fixed": fusion.fixed_alpha}
             origin = {"text": "text only", "image": "image only", "fixed": "fixed in advance"}
+            extras: Dict[str, Dict[str, object]] = {}
             if name in chosen:
                 scores["dev"] = fuse(text, image, chosen[name])
                 alphas["dev"] = chosen[name]
                 origin["dev"] = "chosen on " + ", ".join(fusion.select_alpha_on[name])
+            if fusion.category_alpha and name in chosen:
+                # Every pair gets its category's alpha; a pair of no chosen category, the dev alpha.
+                labels, column = categories_of(data, name)
+                per_category = {c: r["alpha"] for c, r in by_category.get(name, {}).items()}
+                per_pair = np.array([per_category.get(label, chosen[name]) for label in labels], dtype=np.float64)
+                scores["cat"] = fuse(text, image, per_pair[data.scored])
+                alphas["cat"] = per_pair
+                origin["cat"] = (f"chosen per {column} on " + ", ".join(fusion.select_alpha_on[name])
+                                 if per_category else "no categories: the dev alpha")
+                extras["cat"] = {"alpha_category": labels}
 
             # The endpoints must reproduce the sources: normalising may not reorder anything.
             gold = data.gold
@@ -484,7 +616,7 @@ def run_fusion(config: ExperimentConfig) -> pd.DataFrame:
             correlations = {}
             for role, values in scores.items():
                 frame = write_predictions(paths, keys[role], system, data, values, alphas[role],
-                                          origin[role], fusion.normalization)
+                                          origin[role], fusion.normalization, extras.get(role))
                 rows = metric_rows(frame[frame[FUSED_COLUMN].notna()], name, keys[role], config,
                                    prediction_column=FUSED_COLUMN)
                 for row in rows:
@@ -492,7 +624,7 @@ def run_fusion(config: ExperimentConfig) -> pd.DataFrame:
                 metrics.extend(rows)
                 correlations[role] = compute_correlations(values, gold)
 
-            others = {role: scores[role] for role in ("fixed", "dev") if role in scores}
+            others = {role: scores[role] for role in ("fixed", "dev", "cat") if role in scores}
             intervals = (paired_bootstrap(gold, scores["text"], others, fusion.bootstrap,
                                           config.metrics.bootstrap_seed, config.metrics.confidence)
                          if fusion.bootstrap else {})
@@ -508,6 +640,21 @@ def run_fusion(config: ExperimentConfig) -> pd.DataFrame:
                     row[f"{role}_delta_{metric}"] = getattr(correlations[role], metric) - getattr(correlations["text"], metric)
                     low, high = intervals.get(role, {}).get(metric, (np.nan, np.nan))
                     row[f"{role}_delta_{metric}_ci_low"], row[f"{role}_delta_{metric}_ci_high"] = low, high
+            if "cat" in scores:
+                # The question -cat asks: does an alpha per category beat the one dev alpha?
+                versus_dev = (paired_bootstrap(gold, scores["dev"], {"cat": scores["cat"]}, fusion.bootstrap,
+                                               config.metrics.bootstrap_seed, config.metrics.confidence)
+                              if fusion.bootstrap else {})
+                chosen_here = by_category.get(name)
+                row["cat_label"] = column if chosen_here else "—"
+                row["cat_alphas"] = ("; ".join(f"{c} {r['alpha']:.2f}{' (dev α)' if r['fallback'] else ''}"
+                                               for c, r in chosen_here.items()) if chosen_here else "—")
+                for metric in ("spearman", "pearson"):
+                    row[f"cat_vs_dev_delta_{metric}"] = (getattr(correlations["cat"], metric)
+                                                         - getattr(correlations["dev"], metric))
+                    low, high = versus_dev.get("cat", {}).get(metric, (np.nan, np.nan))
+                    row[f"cat_vs_dev_delta_{metric}_ci_low"] = low
+                    row[f"cat_vs_dev_delta_{metric}_ci_high"] = high
             comparison.append(row)
             manifest.record_run({
                 "model": system.key, "dataset": name, "n_pairs": int(len(data.frame)),
@@ -515,6 +662,8 @@ def run_fusion(config: ExperimentConfig) -> pd.DataFrame:
                 "runtime_seconds": round(time.time() - started, 2),
                 "n_truncated_pairs": int(data.frame["pair_truncated"].sum()),
                 "n_unscored": data.n_unscored, "dev_alpha": chosen.get(name),
+                **({"category_alphas": {c: r["alpha"] for c, r in by_category[name].items()}}
+                   if name in by_category else {}),
             })
             _log.info("[%s | %s] %d pairs | ρ text %.4f image %.4f α=%g %.4f%s", system.key, name, gold.size,
                       correlations["text"].spearman, correlations["image"].spearman, fusion.fixed_alpha,
@@ -522,7 +671,7 @@ def run_fusion(config: ExperimentConfig) -> pd.DataFrame:
                       f" dev α={chosen[name]:g} {correlations['dev'].spearman:.4f}" if name in chosen else "")
 
         for role, key in keys.items():
-            if role == "dev" and not chosen:
+            if role in ("dev", "cat") and not chosen:
                 continue
             manifest.payload["models"][key] = {
                 "model_id": f"late fusion: α·{system.text.model} + (1−α)·{system.image.model}",

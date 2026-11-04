@@ -358,6 +358,9 @@ class FusionConfig:
     dev_sets: Dict[str, DevSet] = field(default_factory=dict)
     #: Evaluation dataset -> the dev sets (or datasets) its alpha is chosen on.
     select_alpha_on: Dict[str, List[str]] = field(default_factory=dict)
+    #: Also choose one alpha per category (SICK NLI label, other datasets'
+    #: domain) on the dev pairs of that category: the ``-cat`` systems.
+    category_alpha: bool = False
 
     @property
     def enabled_systems(self) -> List[FusionSystem]:
@@ -365,12 +368,15 @@ class FusionConfig:
 
     def output_keys(self, system: FusionSystem) -> Dict[str, str]:
         """The prediction systems one fused pair of sources writes, by role."""
-        return {
+        keys = {
             "text": f"{system.key}-text",
             "image": f"{system.key}-image",
             "fixed": f"{system.key}-a{self.fixed_alpha:g}",
             "dev": f"{system.key}-dev",
         }
+        if self.category_alpha:
+            keys["cat"] = f"{system.key}-cat"
+        return keys
 
 
 def _parse_source(raw: Any, base: Path, where: str) -> FusionSource:

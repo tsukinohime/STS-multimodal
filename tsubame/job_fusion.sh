@@ -1,6 +1,6 @@
 #!/bin/bash
 # Late fusion (condition LF) of finished runs' predictions, then the fused
-# systems broken down by category: CPU only, no model, about a minute for the
+# systems broken down by category: CPU only, no model, about two minutes for the
 # full datasets (~1.5 GB memory). Run from the repository root.
 #   qsub -g <group> -l <cpu resource>=1 -v STS_PYTHON="$(command -v python)" tsubame/job_fusion.sh
 # STS_PYTHON selects an already prepared interpreter. When omitted, use the
@@ -23,7 +23,7 @@ metrics, summary, fusion_comparison and alpha_sweep to the config's output
 directory (default outputs/late_fusion). Then `sts.cli breakdown` splits the
 fused systems by category, SICK by NLI label and CxC by sampling_method, into
 <output directory>/breakdown/. Nothing is resumable or cached: a rerun
-recomputes everything in about a minute.
+recomputes everything in about two minutes.
 
 Optional environment variables (pass with qsub -v):
   STS_PYTHON             Absolute path to the prepared Python interpreter.

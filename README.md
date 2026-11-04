@@ -550,7 +550,7 @@ On TSUBAME, `tsubame/job_e2.sh` runs each stage as its own job; see
 
 Per pair, `fused = α · norm(text score) + (1 − α) · norm(image score)`, read from
 the per-pair predictions finished runs already wrote. No model is loaded; the
-whole step is CPU only and takes under a minute on the full datasets.
+whole step is CPU only and takes about two minutes on the full datasets.
 
 ```bash
 python -m sts.cli fuse --config configs/late_fusion.yaml        # needs A0, B1 and D1 finished
@@ -581,6 +581,20 @@ model looking at the text and at the images:
   STS3k (no dev split of its own) from the mean over both. No test split's gold
   scores enter a choice, and dev pairs never overlap the pairs α is applied to
   (checked). The macro average covers cxc-test, sick-test and sts3k only.
+* *Per-category α* (`category_alpha: true`, on in the config). `<key>-cat`
+  chooses one α per category the same way, on the same dev sets: each scored by
+  the Spearman *within* that category on its dev pairs (SICK: NLI label; CxC:
+  `sampling_method`). Every dev set is still normalised as a whole, so all
+  categories share one scale. Each evaluation pair gets its category's α, and
+  its row carries both (`alpha`, `alpha_category`). STS3k has no categories and
+  keeps the `-dev` α, as does a category with fewer than two dev pairs (marked
+  "dev α"). `fusion_comparison.md` adds `-cat` against text only and against
+  `-dev`; `alpha_sweep.md` adds each category's curve. Two caveats. `-cat` reads
+  every evaluation pair's category, which for SICK is gold NLI annotation, so it
+  is an analysis next to `-dev`, not a label-free method. And the
+  within-category criterion ignores where a category sits among the others,
+  which moves with its α: the category's mean fused score is
+  α · its text mean + (1 − α) · its image mean.
 * *Outputs* (`outputs/late_fusion/`): the usual `predictions/`, `metrics`,
   `summary.md`, plus `fusion_comparison.{csv,md}`, which gives each fused
   system's gain over `<key>-text` with a paired-bootstrap 95% CI (1,000
@@ -593,8 +607,8 @@ model looking at the text and at the images:
   others. The TSUBAME job runs the breakdown right after `fuse` (SICK by NLI
   label, CxC by `sampling_method`); by hand:
   `python -m sts.cli breakdown --config configs/late_fusion.yaml --datasets sick-all sick-test cxc-val cxc-test`.
-  α and the normalisation stay those of the whole dataset; nothing is chosen
-  per category.
+  The normalisation stays the whole dataset's. Only `-cat` (above) has an α
+  per category, so the breakdown also shows what it does inside each one.
 
 On TSUBAME, `tsubame/job_fusion.sh` runs `fuse` and then the breakdown as one
 CPU job; see [tsubame/README.md](tsubame/README.md#late-fusion-lf-cpu-job).

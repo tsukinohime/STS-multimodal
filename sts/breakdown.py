@@ -40,14 +40,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
 from .config import ExperimentConfig, get_logger
-from .data import load_dataset
+from .data import STSDataset, load_dataset
 from .data.sick import load_sick_labels
 from .metrics import compute_correlations
 from .pipeline import prediction_column_of
@@ -103,6 +103,20 @@ def find_systems(
     return list(found.values())
 
 
+def pair_labels(
+    config: ExperimentConfig, dataset: STSDataset, label_column: str = "entailment_label"
+) -> Tuple[pd.Series, str]:
+    """Each pair's category, indexed by ``pair_id``, and the column it comes from.
+
+    SICK: the NLI annotation ``label_column``. Any other dataset: its domain
+    (CxC ``sampling_method``); a pair without one is NaN.
+    """
+    if dataset.name.startswith("sick-"):
+        return load_sick_labels(config.data.sick_path, dataset.split, label_column), label_column
+    pairs = dataset.to_dataframe().set_index("pair_id")
+    return pairs["domain"].replace("", np.nan), str(dataset.notes.get("domain_column") or "domain")
+
+
 def aligned_frame(
     config: ExperimentConfig, dataset_name: str, systems: Sequence[System], label_column: str
 ) -> Optional[Dict[str, object]]:
@@ -112,11 +126,7 @@ def aligned_frame(
     """
     dataset = load_dataset(dataset_name, config.data)
     pairs = dataset.to_dataframe().set_index("pair_id")
-    if dataset.name.startswith("sick-"):
-        labels = load_sick_labels(config.data.sick_path, dataset.split, label_column)
-    else:
-        label_column = str(dataset.notes.get("domain_column") or "domain")
-        labels = pairs["domain"].replace("", np.nan)
+    labels, label_column = pair_labels(config, dataset, label_column)
     if labels.nunique() < 2:
         _log.warning("%s: fewer than two %s values, nothing to break down", dataset_name, label_column)
         return None

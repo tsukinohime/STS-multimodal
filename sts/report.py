@@ -155,6 +155,9 @@ CONDITION_TEXT = {
         "sources alone on the same pairs (alpha 1 and 0); `-a<alpha>` uses an alpha fixed in "
         "advance; `-dev` an alpha chosen on development pairs only (CxC val, SICK train + trial) "
         "and applied to disjoint evaluation pairs, so no test split's gold scores enter a choice. "
+        "`-cat` (with category_alpha) chooses one alpha per category the same way, scored within the "
+        "category (SICK NLI label, CxC sampling method), and reads each evaluation pair's category: an "
+        "analysis next to `-dev`, not a label-free method. "
         "The macro average covers the evaluation datasets only. fusion_comparison.md has each "
         "fused system's gain over text-only with a paired-bootstrap CI; alpha_sweep.md the whole "
         "curve from image-only to text-only.",

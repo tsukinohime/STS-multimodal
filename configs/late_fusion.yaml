@@ -17,6 +17,7 @@
 #   <key>-image  alpha = 0, the image run alone         (sanity: reproduces it)
 #   <key>-a0.5   alpha fixed in advance
 #   <key>-dev    alpha chosen on dev pairs (select_alpha_on), evaluation sets only
+#   <key>-cat    one alpha per category, chosen the same way (category_alpha)
 # plus fusion_comparison.{csv,md} (gain over text-only, paired-bootstrap CI) and
 # alpha_sweep.{csv,md} (Spearman for every alpha of the grid).
 #
@@ -67,6 +68,13 @@ fusion:
     cxc-test: [cxc-val]
     sick-test: [sick-dev]
     sts3k: [cxc-val, sick-dev]      # STS3k has no dev split: the mean over both
+
+  # Also one alpha per category, on the same dev sets: <key>-cat. Each category's
+  # alpha maximises the Spearman WITHIN that category on its dev pairs (SICK: NLI
+  # label, CxC: sampling_method); every evaluation pair gets its category's alpha.
+  # STS3k has no categories and keeps the dev alpha. -cat reads each evaluation
+  # pair's category (gold NLI annotation for SICK): an analysis next to -dev.
+  category_alpha: true
 
   systems:
     - key: lf-emb

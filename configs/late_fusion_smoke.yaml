@@ -46,6 +46,7 @@ fusion:
     cxc-test: [cxc-val]
     sick-test: [sick-dev]
     sts3k: [cxc-val, sick-dev]
+  category_alpha: true
   systems:
     - key: lf-emb-stub
       text:  {output_dir: outputs/smoke, model: minilm-l6-v2}

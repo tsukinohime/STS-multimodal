@@ -387,7 +387,7 @@ the main README explains how to read it.
 `job_fusion.sh` runs `python -m sts.cli fuse --config configs/late_fusion.yaml`
 (main README, "Late fusion"), then `sts.cli breakdown` on the fused systems:
 SICK by NLI label, CxC by `sampling_method`. Both read per-pair predictions and
-load no model: about a minute and ~1.5 GB on the full datasets, so the smallest
+load no model: about two minutes and ~1.5 GB on the full datasets, so the smallest
 CPU allocation is enough.
 
 ```bash
@@ -405,12 +405,15 @@ no categories). `bash tsubame/job_fusion.sh --help` lists the rest.
 
 Results land in `outputs/late_fusion/`; start with `fusion_comparison.md`, then
 `breakdown/<dataset>__<label>.md`, which sets each fused pair's `-text`,
-`-image`, `-a0.5` and `-dev` side by side (`-text` and `-image` are the two
-sources on the same pairs). cxc-val and sick-all are where α is chosen and have
-no `-dev`, so the log warns that its predictions are missing there. Fused scores
-are z-scores: their `pred_mean` is in standard deviations, and the judge-vs-gold
-table leaves them out. α and the normalisation are the whole dataset's; nothing
-is chosen per category.
+`-image`, `-a0.5`, `-dev` and `-cat` side by side (`-text` and `-image` are the
+two sources on the same pairs). cxc-val and sick-all are where α is chosen and
+have no `-dev` or `-cat`, so the log warns that their predictions are missing
+there. Fused scores are z-scores: their `pred_mean` is in standard deviations,
+and the judge-vs-gold table leaves them out. The normalisation is the whole
+dataset's; `-cat` takes one α per category (SICK NLI label, CxC
+`sampling_method`), chosen on the dev pairs of that category, and
+`fusion_comparison.md` sets it against `-dev`. The job log lists each chosen α
+(`alpha per ...`).
 
 ## Run (embedding)
 
