@@ -416,10 +416,11 @@ def comparison_markdown(rows: List[Dict[str, object]], fusion: FusionConfig) -> 
             )
             per_category = [r for r in rows if r["system"] == system and f"cat_{metric}" in r]
             if per_category:
-                lines += ["", f"Per category (`{system}-cat`), against text only and against dev-α:", ""]
+                lines += ["", f"Per category (`{system}-cat`): the α each category got, then the {name} of "
+                          "`-dev` and `-cat` over the whole dataset, every pair fused with its own category's α:", ""]
                 lines += _table(
-                    ["dataset", "pairs", "category", "α per category", "dev-α", "per-category α",
-                     "Δ vs text", "Δ vs dev-α"],
+                    ["dataset", "pairs", "category", "α per category", "`-dev`", "`-cat`",
+                     "Δ `-cat` vs text", "Δ `-cat` vs `-dev`"],
                     [[str(r["dataset"]), str(r["n"]), str(r["cat_label"]), str(r["cat_alphas"]),
                       _fmt(r[f"dev_{metric}"]), _fmt(r[f"cat_{metric}"]),
                       _delta(r, "cat", metric), _delta(r, "cat_vs_dev", metric)] for r in per_category],
